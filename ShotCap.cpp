@@ -236,10 +236,237 @@ void printUsage()
         << "  -timestamp            Annotate screenshot with current date/time\n"
         << "  -repeat <i> <n>       Repeat capture every i seconds for n times\n"
         << "  -listmonitors         List available monitors and exit\n"
-        << "  -listwindows          List visible top-level windows and exit\n"
+        << "  -listwindows [N]      List titled top-level windows (titles usable with\n"
+        << "                        -w) and exit. Optional N caps output to first N\n"
+        << "                        entries from top of z-order.\n"
+        << "  -listallwindows       Debug: list ALL top-level windows (visible+hidden,\n"
+        << "                        titled+untitled, with class + rect) and exit\n"
+        << "  -inspect <file>       Open <file> in pixel-inspector window. Click 3 pixels\n"
+        << "                        (or Space at crosshair) to emit a pix3eq fingerprint line\n"
+        << "                        to stdout AND clipboard. Mouse/arrows move crosshair,\n"
+        << "                        +/- zoom, R resets samples, ESC exits.\n"
         << "  -vl                   Enable verbose logging\n"
         << "  -v, --version         Show current shotcap version\n"
         << "  -h, --help            Display this help message\n";
+}
+
+//---------------------------------------------------------------------
+// --- -inspect mode: pixel inspector for building pix3eq fingerprints
+//---------------------------------------------------------------------
+// Opens a captured image in a window with a crosshair you can move via
+// mouse or arrows; click/Space records a (x, y, color) sample; after 3
+// samples it emits a pix3eq-ready script line to stdout AND clipboard.
+
+struct InspectSample {
+    int x, y;
+    COLORREF color;
+};
+
+struct InspectState {
+    Gdiplus::Bitmap* image = nullptr;
+    int imgW = 0, imgH = 0;
+    int zoom = 8;
+    int cursorX = 0, cursorY = 0;
+    int panX = 0, panY = 0;
+    std::vector<InspectSample> samples;
+};
+static InspectState g_insp;
+static const int INSP_STATUS_H = 30;
+
+static COLORREF inspReadPixel(int x, int y)
+{
+    if (!g_insp.image || x < 0 || y < 0 || x >= g_insp.imgW || y >= g_insp.imgH)
+        return 0;
+    Gdiplus::Color c;
+    if (g_insp.image->GetPixel(x, y, &c) != Gdiplus::Ok) return 0;
+    return RGB(c.GetR(), c.GetG(), c.GetB());
+}
+
+static void inspAutoPan(HWND hWnd)
+{
+    RECT rc; GetClientRect(hWnd, &rc);
+    int clientW = rc.right, clientH = rc.bottom - INSP_STATUS_H;
+    int cx = g_insp.cursorX * g_insp.zoom + g_insp.zoom / 2;
+    int cy = g_insp.cursorY * g_insp.zoom + g_insp.zoom / 2;
+    const int M = 50;
+    if (cx - g_insp.panX < M) g_insp.panX = cx - M;
+    if (cx - g_insp.panX > clientW - M) g_insp.panX = cx - clientW + M;
+    if (cy - g_insp.panY < M) g_insp.panY = cy - M;
+    if (cy - g_insp.panY > clientH - M) g_insp.panY = cy - clientH + M;
+    if (g_insp.panX < 0) g_insp.panX = 0;
+    if (g_insp.panY < 0) g_insp.panY = 0;
+}
+
+static void inspEmitReady(HWND hWnd)
+{
+    if (g_insp.samples.size() < 3) return;
+    char buf[512];
+    sprintf_s(buf, sizeof(buf),
+        "0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 10 pix3eq\r\n",
+        g_insp.samples[0].x, g_insp.samples[0].y, (unsigned)g_insp.samples[0].color,
+        g_insp.samples[1].x, g_insp.samples[1].y, (unsigned)g_insp.samples[1].color,
+        g_insp.samples[2].x, g_insp.samples[2].y, (unsigned)g_insp.samples[2].color);
+    std::cout << buf;
+    if (OpenClipboard(hWnd)) {
+        EmptyClipboard();
+        size_t len = strlen(buf);
+        HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, len + 1);
+        if (hg) {
+            char* p = (char*)GlobalLock(hg);
+            memcpy(p, buf, len + 1);
+            GlobalUnlock(hg);
+            SetClipboardData(CF_TEXT, hg);
+        }
+        CloseClipboard();
+    }
+}
+
+static LRESULT CALLBACK InspectWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        RECT rc; GetClientRect(hWnd, &rc);
+
+        HDC memDC = CreateCompatibleDC(hdc);
+        HBITMAP memBM = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        HGDIOBJ oldBM = SelectObject(memDC, memBM);
+        FillRect(memDC, &rc, (HBRUSH)(COLOR_BTNFACE + 1));
+
+        if (g_insp.image) {
+            Gdiplus::Graphics g(memDC);
+            g.SetInterpolationMode(Gdiplus::InterpolationModeNearestNeighbor);
+            g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+            int scaledW = g_insp.imgW * g_insp.zoom;
+            int scaledH = g_insp.imgH * g_insp.zoom;
+            g.DrawImage(g_insp.image, -g_insp.panX, INSP_STATUS_H - g_insp.panY, scaledW, scaledH);
+
+            HPEN penM = CreatePen(PS_SOLID, 1, RGB(255, 0, 255));
+            HGDIOBJ oldPen = SelectObject(memDC, penM);
+            HGDIOBJ oldBr = SelectObject(memDC, GetStockObject(NULL_BRUSH));
+            for (auto& s : g_insp.samples) {
+                int sx = s.x * g_insp.zoom + g_insp.zoom / 2 - g_insp.panX;
+                int sy = INSP_STATUS_H + s.y * g_insp.zoom + g_insp.zoom / 2 - g_insp.panY;
+                Rectangle(memDC, sx - 8, sy - 8, sx + 8, sy + 8);
+            }
+            HPEN penY = CreatePen(PS_SOLID, 1, RGB(255, 255, 0));
+            SelectObject(memDC, penY);
+            int cx = g_insp.cursorX * g_insp.zoom + g_insp.zoom / 2 - g_insp.panX;
+            int cy = INSP_STATUS_H + g_insp.cursorY * g_insp.zoom + g_insp.zoom / 2 - g_insp.panY;
+            MoveToEx(memDC, cx - 20, cy, NULL); LineTo(memDC, cx + 20, cy);
+            MoveToEx(memDC, cx, cy - 20, NULL); LineTo(memDC, cx, cy + 20);
+            SelectObject(memDC, oldPen); SelectObject(memDC, oldBr);
+            DeleteObject(penM); DeleteObject(penY);
+        }
+
+        RECT sr = { 0, 0, rc.right, INSP_STATUS_H };
+        FillRect(memDC, &sr, (HBRUSH)GetStockObject(WHITE_BRUSH));
+        COLORREF col = inspReadPixel(g_insp.cursorX, g_insp.cursorY);
+        char statText[256];
+        sprintf_s(statText, sizeof(statText),
+            "x=0x%04X y=0x%04X color=0x%06X  zoom=%dx  samples=%zu/3   "
+            "(mouse/arrows move, click/Space=record, +/-=zoom, R=reset, ESC=exit)",
+            g_insp.cursorX, g_insp.cursorY, (unsigned)col, g_insp.zoom, g_insp.samples.size());
+        SetBkMode(memDC, TRANSPARENT);
+        TextOutA(memDC, 10, 8, statText, (int)strlen(statText));
+
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
+        SelectObject(memDC, oldBM);
+        DeleteObject(memBM);
+        DeleteDC(memDC);
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+        int ix = (mx + g_insp.panX) / g_insp.zoom;
+        int iy = (my - INSP_STATUS_H + g_insp.panY) / g_insp.zoom;
+        if (ix >= 0 && iy >= 0 && ix < g_insp.imgW && iy < g_insp.imgH) {
+            g_insp.cursorX = ix; g_insp.cursorY = iy;
+            InvalidateRect(hWnd, NULL, FALSE);
+        }
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        if (g_insp.samples.size() < 3) {
+            COLORREF c = inspReadPixel(g_insp.cursorX, g_insp.cursorY);
+            g_insp.samples.push_back({ g_insp.cursorX, g_insp.cursorY, c });
+            if (g_insp.samples.size() == 3) inspEmitReady(hWnd);
+            InvalidateRect(hWnd, NULL, FALSE);
+        }
+        return 0;
+    }
+    case WM_KEYDOWN: {
+        int step = (GetKeyState(VK_SHIFT) & 0x8000) ? 10 : 1;
+        bool moved = false;
+        switch (wp) {
+        case VK_LEFT:  g_insp.cursorX -= step; moved = true; break;
+        case VK_RIGHT: g_insp.cursorX += step; moved = true; break;
+        case VK_UP:    g_insp.cursorY -= step; moved = true; break;
+        case VK_DOWN:  g_insp.cursorY += step; moved = true; break;
+        case VK_SPACE:
+            if (g_insp.samples.size() < 3) {
+                COLORREF c = inspReadPixel(g_insp.cursorX, g_insp.cursorY);
+                g_insp.samples.push_back({ g_insp.cursorX, g_insp.cursorY, c });
+                if (g_insp.samples.size() == 3) inspEmitReady(hWnd);
+            }
+            break;
+        case 'R': g_insp.samples.clear(); break;
+        case VK_OEM_PLUS: case VK_ADD:
+            if (g_insp.zoom < 32) g_insp.zoom *= 2; break;
+        case VK_OEM_MINUS: case VK_SUBTRACT:
+            if (g_insp.zoom > 1) g_insp.zoom /= 2; break;
+        case VK_ESCAPE: DestroyWindow(hWnd); return 0;
+        }
+        if (g_insp.cursorX < 0) g_insp.cursorX = 0;
+        if (g_insp.cursorY < 0) g_insp.cursorY = 0;
+        if (g_insp.cursorX >= g_insp.imgW) g_insp.cursorX = g_insp.imgW - 1;
+        if (g_insp.cursorY >= g_insp.imgH) g_insp.cursorY = g_insp.imgH - 1;
+        if (moved) inspAutoPan(hWnd);
+        InvalidateRect(hWnd, NULL, FALSE);
+        return 0;
+    }
+    case WM_CLOSE:   DestroyWindow(hWnd); return 0;
+    case WM_DESTROY: PostQuitMessage(0); return 0;
+    }
+    return DefWindowProc(hWnd, msg, wp, lp);
+}
+
+static int runInspectMode(const std::wstring& filePath)
+{
+    g_insp.image = Gdiplus::Bitmap::FromFile(filePath.c_str());
+    if (!g_insp.image || g_insp.image->GetLastStatus() != Gdiplus::Ok) {
+        std::wcerr << L"[ERROR] Could not load image: " << filePath << std::endl;
+        return 1;
+    }
+    g_insp.imgW = g_insp.image->GetWidth();
+    g_insp.imgH = g_insp.image->GetHeight();
+
+    WNDCLASSEXW wc = { sizeof(wc) };
+    wc.lpfnWndProc = InspectWndProc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = L"ShotCapInspect";
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    RegisterClassExW(&wc);
+
+    int wndW = (std::min)(1600, g_insp.imgW * g_insp.zoom + 16);
+    int wndH = (std::min)(1000, g_insp.imgH * g_insp.zoom + INSP_STATUS_H + 39);
+
+    HWND hWnd = CreateWindowExW(0, L"ShotCapInspect", L"ShotCap Inspect — pix3eq fingerprint builder",
+        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, wndW, wndH,
+        NULL, NULL, wc.hInstance, NULL);
+    ShowWindow(hWnd, SW_SHOWNORMAL);
+    UpdateWindow(hWnd);
+
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg); DispatchMessage(&msg);
+    }
+    delete g_insp.image;
+    g_insp.image = nullptr;
+    return 0;
 }
 
 //---------------------------------------------------------------------
@@ -271,20 +498,53 @@ BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC, LPRECT lprcMonitor, LPARAM
 }
 
 //---------------------------------------------------------------------
-// Callback for enumerating top-level windows.
+// Callback for -listwindows: titled top-level windows. We deliberately
+// DON'T filter on IsWindowVisible — UWP/WinUI/Edge/Chrome often flag
+// their visible HWND as hidden (cloaked by DWM) so IsWindowVisible
+// returns 0 even though the window is on screen. A non-empty title is
+// the better usability filter for picking a -w argument.
+//
+// Supports optional count cap via -listwindows N: stops enumeration
+// after writing N entries.  EnumWindows walks top-of-z-order first,
+// so the cap gives you the foreground/most-recent windows.
+struct ListWinCtx { std::wstringstream* ss; int limit; int count; };
+
 BOOL CALLBACK EnumWindowsProc(HWND hWnd, LPARAM lParam)
 {
-    if (IsWindowVisible(hWnd))
-    {
-        const int len = 256;
-        wchar_t title[len] = { 0 };
-        GetWindowTextW(hWnd, title, len);
-        if (wcslen(title) > 0)
-        {
-            std::wstringstream* ss = reinterpret_cast<std::wstringstream*>(lParam);
-            *ss << L"Handle: " << hWnd << L" | Title: " << title << std::endl;
-        }
-    }
+    ListWinCtx* ctx = reinterpret_cast<ListWinCtx*>(lParam);
+    if (ctx->limit > 0 && ctx->count >= ctx->limit) return FALSE;
+    wchar_t title[256] = { 0 };
+    GetWindowTextW(hWnd, title, 256);
+    if (wcslen(title) == 0) return TRUE;
+    *ctx->ss << L"Handle: " << hWnd << L" | Title: " << title << std::endl;
+    ctx->count++;
+    return TRUE;
+}
+
+//---------------------------------------------------------------------
+// Callback for -listallwindows: every top-level HWND returned by
+// EnumWindows, including hidden + untitled.  Adds class + rect columns
+// for debug.  WinSpy/Window-Detective in lib_cf22_h/ahk give a richer
+// tree view if you need more.
+BOOL CALLBACK EnumAllWindowsProc(HWND hWnd, LPARAM lParam)
+{
+    wchar_t title[256] = { 0 };
+    wchar_t cls[128] = { 0 };
+    GetWindowTextW(hWnd, title, 256);
+    GetClassNameW(hWnd, cls, 128);
+    RECT r = { 0 };
+    GetWindowRect(hWnd, &r);
+    wchar_t vis = IsWindowVisible(hWnd) ? L'V' : L'H';
+
+    std::wstringstream* ss = reinterpret_cast<std::wstringstream*>(lParam);
+    *ss << L"  [0x" << std::hex << std::setw(8) << std::setfill(L'0')
+        << (uintptr_t)hWnd << std::dec << std::setfill(L' ')
+        << L"] " << vis
+        << L" cls=\"" << cls << L"\""
+        << L" title=\"" << title << L"\""
+        << L" rect=(" << r.left << L"," << r.top
+        << L"," << (r.right - r.left) << L"x" << (r.bottom - r.top) << L")"
+        << std::endl;
     return TRUE;
 }
 
@@ -348,7 +608,10 @@ int main(int argc, char* argv[])
     bool verbose = false;
     bool listMonitors = false;
     bool listWindows = false;
+    int  listWindowsLimit = 0;          // 0 = unlimited
+    bool listAllWindows = false;
     bool interactiveSelect = false;
+    std::wstring inspectFile;
 
     // Parse command-line arguments.
     for (int i = 1; i < argc; i++)
@@ -464,6 +727,15 @@ int main(int argc, char* argv[])
         {
             showAfterCapture = true;
         }
+        else if (arg == "-inspect" && i + 1 < argc)
+        {
+            int len = MultiByteToWideChar(CP_UTF8, 0, argv[i + 1], -1, NULL, 0);
+            wchar_t* buffer = new wchar_t[len];
+            MultiByteToWideChar(CP_UTF8, 0, argv[i + 1], -1, buffer, len);
+            inspectFile = buffer;
+            delete[] buffer;
+            i++;
+        }
         else if (arg == "-p")
         {
             capturePointer = true;
@@ -486,6 +758,19 @@ int main(int argc, char* argv[])
         else if (arg == "-listwindows")
         {
             listWindows = true;
+            // Optional positive integer cap: -listwindows 10
+            if (i + 1 < argc) {
+                char* end = nullptr;
+                long n = std::strtol(argv[i + 1], &end, 10);
+                if (end != argv[i + 1] && *end == '\0' && n > 0) {
+                    listWindowsLimit = (int)n;
+                    ++i;
+                }
+            }
+        }
+        else if (arg == "-listallwindows")
+        {
+            listAllWindows = true;
         }
         else if (arg == "-vl")
         {
@@ -524,8 +809,19 @@ int main(int argc, char* argv[])
     if (listWindows)
     {
         std::wstringstream ss;
-        EnumWindows(EnumWindowsProc, (LPARAM)&ss);
-        std::wcout << L"Visible windows:\n" << ss.str();
+        ListWinCtx ctx { &ss, listWindowsLimit, 0 };
+        EnumWindows(EnumWindowsProc, (LPARAM)&ctx);
+        std::wcout << L"Visible windows";
+        if (listWindowsLimit > 0)
+            std::wcout << L" (top " << ctx.count << L" of cap " << listWindowsLimit << L")";
+        std::wcout << L":\n" << ss.str();
+        return 0;
+    }
+    if (listAllWindows)
+    {
+        std::wstringstream ss;
+        EnumWindows(EnumAllWindowsProc, (LPARAM)&ss);
+        std::wcout << L"All top-level windows (V=visible, H=hidden):\n" << ss.str();
         return 0;
     }
 
@@ -566,6 +862,14 @@ int main(int argc, char* argv[])
     {
         std::cerr << "Failed to initialize GDI+." << std::endl;
         return -1;
+    }
+
+    // -inspect short-circuits the capture pipeline.
+    if (!inspectFile.empty())
+    {
+        int rc = runInspectMode(inspectFile);
+        GdiplusShutdown(gdiplusToken);
+        return rc;
     }
 
     // Lambda: Capture and save a screenshot using current settings.
