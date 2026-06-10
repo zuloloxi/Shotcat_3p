@@ -245,6 +245,23 @@ void printUsage()
         << "                        (or Space at crosshair) to emit a pix3eq fingerprint line\n"
         << "                        to stdout AND clipboard. Mouse/arrows move crosshair,\n"
         << "                        +/- zoom, R resets samples, ESC exits.\n"
+        << "  -base X,Y             (with -inspect) subtract (X,Y) from emitted coords —\n"
+        << "                        emits cell-relative dx,dy values as a comment-marked\n"
+        << "                        line for OCR digit-table data. Pair with -inspect.\n"
+        << "  -check \"<triplets>\"   Batch verify N pixels: each triplet is\n"
+        << "                        dx,dy,0xRRGGBB (space-separated), sampled at\n"
+        << "                        (base+dx, base+dy) of the image loaded via -inspect.\n"
+        << "                        Logs got/want/diff/MATCH-MISS per row, exit 0 if all\n"
+        << "                        within -tol (default 20 per channel). No window opens.\n"
+        << "  -tol N                Per-channel tolerance for -check (default 20).\n"
+        << "  -grid WxH             Dump a WxH ASCII shape map (. dark / o mid / W light)\n"
+        << "                        starting at -base. Lets you see digit shape at a glance.\n"
+        << "                        Pair with -inspect <file> and -base X,Y.\n"
+        << "  -resize WxH           Preprocess: scale -inspect <input> to WxH and save as\n"
+        << "                        -f <output>. Use to normalize a screenshot to a fixed\n"
+        << "                        reference resolution before OCR (e.g. 1280x720).\n"
+        << "  -crop X,Y,W,H         Preprocess: extract a sub-rect of -inspect <input> and\n"
+        << "                        save as -f <output>. Crop runs BEFORE -resize.\n"
         << "  -vl                   Enable verbose logging\n"
         << "  -v, --version         Show current shotcap version\n"
         << "  -h, --help            Display this help message\n";
@@ -268,6 +285,8 @@ struct InspectState {
     int zoom = 8;
     int cursorX = 0, cursorY = 0;
     int panX = 0, panY = 0;
+    int baseX = 0, baseY = 0;   // -base X,Y: subtract from emitted coords
+    bool baseSet = false;       // controls emit format
     std::vector<InspectSample> samples;
 };
 static InspectState g_insp;
@@ -293,6 +312,17 @@ static void inspAutoPan(HWND hWnd)
     if (cx - g_insp.panX > clientW - M) g_insp.panX = cx - clientW + M;
     if (cy - g_insp.panY < M) g_insp.panY = cy - M;
     if (cy - g_insp.panY > clientH - M) g_insp.panY = cy - clientH + M;
+    // Clamp panX/panY so the image never scrolls past its own edges
+    // — without this, holding Right at high zoom keeps growing panX
+    // until the visible viewport sits beyond imgW and shows blank.
+    int scaledW = g_insp.imgW * g_insp.zoom;
+    int scaledH = g_insp.imgH * g_insp.zoom;
+    int maxPanX = scaledW - clientW;
+    int maxPanY = scaledH - clientH;
+    if (maxPanX < 0) maxPanX = 0;
+    if (maxPanY < 0) maxPanY = 0;
+    if (g_insp.panX > maxPanX) g_insp.panX = maxPanX;
+    if (g_insp.panY > maxPanY) g_insp.panY = maxPanY;
     if (g_insp.panX < 0) g_insp.panX = 0;
     if (g_insp.panY < 0) g_insp.panY = 0;
 }
@@ -301,11 +331,26 @@ static void inspEmitReady(HWND hWnd)
 {
     if (g_insp.samples.size() < 3) return;
     char buf[512];
-    sprintf_s(buf, sizeof(buf),
-        "0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 10 pix3eq\r\n",
-        g_insp.samples[0].x, g_insp.samples[0].y, (unsigned)g_insp.samples[0].color,
-        g_insp.samples[1].x, g_insp.samples[1].y, (unsigned)g_insp.samples[1].color,
-        g_insp.samples[2].x, g_insp.samples[2].y, (unsigned)g_insp.samples[2].color);
+    int bx = g_insp.baseX, by = g_insp.baseY;
+    int x1 = g_insp.samples[0].x - bx, y1 = g_insp.samples[0].y - by;
+    int x2 = g_insp.samples[1].x - bx, y2 = g_insp.samples[1].y - by;
+    int x3 = g_insp.samples[2].x - bx, y3 = g_insp.samples[2].y - by;
+    if (g_insp.baseSet) {
+        // Table-entry format: cell-relative offsets, comment-marked
+        // for direct paste into an OCR digit-table data section.
+        sprintf_s(buf, sizeof(buf),
+            "; pix3 base=(%d,%d) dx1=0x%X dy1=0x%X c1=0x%06X  dx2=0x%X dy2=0x%X c2=0x%06X  dx3=0x%X dy3=0x%X c3=0x%06X\r\n",
+            bx, by,
+            x1, y1, (unsigned)g_insp.samples[0].color,
+            x2, y2, (unsigned)g_insp.samples[1].color,
+            x3, y3, (unsigned)g_insp.samples[2].color);
+    } else {
+        sprintf_s(buf, sizeof(buf),
+            "0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 10 pix3eq\r\n",
+            x1, y1, (unsigned)g_insp.samples[0].color,
+            x2, y2, (unsigned)g_insp.samples[1].color,
+            x3, y3, (unsigned)g_insp.samples[2].color);
+    }
     std::cout << buf;
     if (OpenClipboard(hWnd)) {
         EmptyClipboard();
@@ -363,11 +408,20 @@ static LRESULT CALLBACK InspectWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp
         RECT sr = { 0, 0, rc.right, INSP_STATUS_H };
         FillRect(memDC, &sr, (HBRUSH)GetStockObject(WHITE_BRUSH));
         COLORREF col = inspReadPixel(g_insp.cursorX, g_insp.cursorY);
-        char statText[256];
-        sprintf_s(statText, sizeof(statText),
-            "x=0x%04X y=0x%04X color=0x%06X  zoom=%dx  samples=%zu/3   "
-            "(mouse/arrows move, click/Space=record, +/-=zoom, R=reset, ESC=exit)",
-            g_insp.cursorX, g_insp.cursorY, (unsigned)col, g_insp.zoom, g_insp.samples.size());
+        char statText[320];
+        if (g_insp.baseSet) {
+            sprintf_s(statText, sizeof(statText),
+                "x=0x%04X y=0x%04X (dx=0x%X dy=0x%X) base=(%d,%d) color=0x%06X  zoom=%dx  samples=%zu/3",
+                g_insp.cursorX, g_insp.cursorY,
+                g_insp.cursorX - g_insp.baseX, g_insp.cursorY - g_insp.baseY,
+                g_insp.baseX, g_insp.baseY,
+                (unsigned)col, g_insp.zoom, g_insp.samples.size());
+        } else {
+            sprintf_s(statText, sizeof(statText),
+                "x=0x%04X y=0x%04X color=0x%06X  zoom=%dx  samples=%zu/3   "
+                "(mouse/arrows move, click/Space=record, +/-=zoom, R=reset, ESC=exit)",
+                g_insp.cursorX, g_insp.cursorY, (unsigned)col, g_insp.zoom, g_insp.samples.size());
+        }
         SetBkMode(memDC, TRANSPARENT);
         TextOutA(memDC, 10, 8, statText, (int)strlen(statText));
 
@@ -433,6 +487,158 @@ static LRESULT CALLBACK InspectWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp
     return DefWindowProc(hWnd, msg, wp, lp);
 }
 
+// -check batch verifier — reads N (dx,dy,expected_color) triplets from
+// `spec`, samples each at (baseX+dx, baseY+dy) in the loaded image, and
+// logs got/want/diff/MATCH-MISS per row. Returns 0 if every row matches
+// within `tol` per channel, 1 otherwise. No window opens — pure CLI.
+//
+// Spec format: space-separated triplets, each "dx,dy,0xCCC" (commas
+// inside, spaces between triplets). E.g.:
+//    "1,7,0xA09E80 3,6,0xD8D4AC 7,7,0x979579"
+static int runCheckMode(const std::wstring& filePath, const std::string& spec, int tol)
+{
+    g_insp.image = Gdiplus::Bitmap::FromFile(filePath.c_str());
+    if (!g_insp.image || g_insp.image->GetLastStatus() != Gdiplus::Ok) {
+        std::wcerr << L"[ERROR] Could not load image: " << filePath << std::endl;
+        return 1;
+    }
+    g_insp.imgW = g_insp.image->GetWidth();
+    g_insp.imgH = g_insp.image->GetHeight();
+
+    printf("[CHECK] base=(%d,%d) tol=%d\n", g_insp.baseX, g_insp.baseY, tol);
+    int rows = 0, matches = 0;
+    std::istringstream iss(spec);
+    std::string token;
+    while (iss >> token) {
+        int dx = 0, dy = 0;
+        unsigned want = 0;
+        if (sscanf_s(token.c_str(), "%d,%d,0x%x", &dx, &dy, &want) != 3 &&
+            sscanf_s(token.c_str(), "%d,%d,%x", &dx, &dy, &want) != 3) {
+            fprintf(stderr, "[ERROR] bad triplet: %s (want dx,dy,0xRRGGBB)\n", token.c_str());
+            return 1;
+        }
+        int x = g_insp.baseX + dx;
+        int y = g_insp.baseY + dy;
+        COLORREF got = inspReadPixel(x, y);
+        // COLORREF is 0x00BBGGRR; want is given as 0xRRGGBB so flip the
+        // expected so we can diff in matched byte order.
+        unsigned want_bgr = ((want & 0xFF) << 16) | (want & 0xFF00) | ((want >> 16) & 0xFF);
+        int dR = abs((int)((got >> 0) & 0xFF) - (int)((want_bgr >> 0) & 0xFF));
+        int dG = abs((int)((got >> 8) & 0xFF) - (int)((want_bgr >> 8) & 0xFF));
+        int dB = abs((int)((got >> 16) & 0xFF) - (int)((want_bgr >> 16) & 0xFF));
+        bool match = (dR <= tol && dG <= tol && dB <= tol);
+        printf("  (%d,%d) @ (%d,%d) got=0x%06X want=0x%06X diff=(%d,%d,%d) %s\n",
+            dx, dy, x, y, (unsigned)got, want, dR, dG, dB,
+            match ? "MATCH" : "MISS");
+        rows++;
+        if (match) matches++;
+    }
+    printf("[CHECK] %d/%d matched\n", matches, rows);
+    delete g_insp.image;
+    g_insp.image = nullptr;
+    return (matches == rows) ? 0 : 1;
+}
+
+// -grid WxH ASCII shape dump — for each (dx,dy) in [0,W) x [0,H), reads
+// the image pixel at (base+dx, base+dy) and prints one of:
+//   . dark    (luma < 64)
+//   o mid     (64-191)
+//   W light   (>= 192)
+// Top row is dy=0.  Letter labels run x then a numeric row label.  Cuts
+// the table-building loop dramatically: I can SEE the digit shape and
+// pick discriminating offsets visually instead of grinding 50 hex scans.
+static int runGridMode(const std::wstring& filePath, int gridW, int gridH)
+{
+    g_insp.image = Gdiplus::Bitmap::FromFile(filePath.c_str());
+    if (!g_insp.image || g_insp.image->GetLastStatus() != Gdiplus::Ok) {
+        std::wcerr << L"[ERROR] Could not load image: " << filePath << std::endl;
+        return 1;
+    }
+    g_insp.imgW = g_insp.image->GetWidth();
+    g_insp.imgH = g_insp.image->GetHeight();
+    printf("[GRID] base=(%d,%d) size=%dx%d  (. dark / o mid / W light)\n",
+        g_insp.baseX, g_insp.baseY, gridW, gridH);
+    // x-axis header (mod-10 digits)
+    printf("       ");
+    for (int x = 0; x < gridW; ++x) printf("%d", x % 10);
+    printf("\n");
+    for (int dy = 0; dy < gridH; ++dy) {
+        printf(" %3d : ", dy);
+        for (int dx = 0; dx < gridW; ++dx) {
+            COLORREF c = inspReadPixel(g_insp.baseX + dx, g_insp.baseY + dy);
+            int r = (c >> 0) & 0xFF, g = (c >> 8) & 0xFF, b = (c >> 16) & 0xFF;
+            int luma = (r * 30 + g * 59 + b * 11) / 100;
+            char ch = (luma < 64) ? '.' : (luma >= 192) ? 'W' : 'o';
+            putchar(ch);
+        }
+        printf("\n");
+    }
+    delete g_insp.image;
+    g_insp.image = nullptr;
+    return 0;
+}
+
+// Preprocess: load `inFile`, optionally resize to (rw,rh) and/or crop
+// (cx,cy,cw,ch), save to `outFile` as PNG.  Used to normalize captured
+// screenshots to a fixed reference resolution before OCR — fingerprint
+// tables built at the reference resolution then apply universally.
+//
+// resize is applied AFTER crop (so you crop the region of interest at
+// native resolution, then upscale/downscale to the table reference).
+static int runPreprocessMode(const std::wstring& inFile,
+    const std::wstring& outFile,
+    int rw, int rh, int cx, int cy, int cw, int ch)
+{
+    Gdiplus::Bitmap src(inFile.c_str());
+    if (src.GetLastStatus() != Gdiplus::Ok) {
+        std::wcerr << L"[ERROR] Could not load image: " << inFile << std::endl;
+        return 1;
+    }
+    int srcW = src.GetWidth(), srcH = src.GetHeight();
+
+    // ---- crop stage ----
+    Gdiplus::Bitmap* cropped = nullptr;
+    if (cw > 0 && ch > 0) {
+        if (cx < 0 || cy < 0 || cx + cw > srcW || cy + ch > srcH) {
+            std::cerr << "[ERROR] -crop rect out of bounds (src=" << srcW << "x" << srcH << ")\n";
+            return 1;
+        }
+        Gdiplus::Rect r(cx, cy, cw, ch);
+        cropped = src.Clone(r, src.GetPixelFormat());
+        printf("[PREPROCESS] cropped (%d,%d,%dx%d) from %dx%d\n", cx, cy, cw, ch, srcW, srcH);
+    } else {
+        cropped = src.Clone(0, 0, srcW, srcH, src.GetPixelFormat());
+    }
+    int cropW = cropped->GetWidth(), cropH = cropped->GetHeight();
+
+    // ---- resize stage ----
+    Gdiplus::Bitmap* final = cropped;
+    if (rw > 0 && rh > 0 && (rw != cropW || rh != cropH)) {
+        Gdiplus::Bitmap* resized = new Gdiplus::Bitmap(rw, rh, cropped->GetPixelFormat());
+        Gdiplus::Graphics g(resized);
+        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        g.DrawImage(cropped, 0, 0, rw, rh);
+        delete cropped;
+        final = resized;
+        printf("[PREPROCESS] resized %dx%d -> %dx%d\n", cropW, cropH, rw, rh);
+    }
+
+    CLSID encoderClsid;
+    if (GetEncoderClsid(L"image/png", &encoderClsid) < 0) {
+        std::cerr << "[ERROR] PNG encoder not found.\n";
+        delete final;
+        return 1;
+    }
+    Gdiplus::Status st = final->Save(outFile.c_str(), &encoderClsid, NULL);
+    delete final;
+    if (st != Gdiplus::Ok) {
+        std::wcerr << L"[ERROR] Failed to save: " << outFile << std::endl;
+        return 1;
+    }
+    std::wcout << L"[PREPROCESS] wrote " << outFile << std::endl;
+    return 0;
+}
+
 static int runInspectMode(const std::wstring& filePath)
 {
     g_insp.image = Gdiplus::Bitmap::FromFile(filePath.c_str());
@@ -459,6 +665,13 @@ static int runInspectMode(const std::wstring& filePath)
         NULL, NULL, wc.hInstance, NULL);
     ShowWindow(hWnd, SW_SHOWNORMAL);
     UpdateWindow(hWnd);
+    // Force keyboard focus to the inspect window — without this, when
+    // launched from a cmd shell with VS or another foreground app
+    // active, the inspect window opens unfocused and arrow keys go to
+    // whatever still owns focus.  Mouse click would eventually fix it,
+    // but blind keyboard nav is the symptom.
+    SetForegroundWindow(hWnd);
+    SetFocus(hWnd);
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
@@ -612,6 +825,11 @@ int main(int argc, char* argv[])
     bool listAllWindows = false;
     bool interactiveSelect = false;
     std::wstring inspectFile;
+    std::string  checkSpec;             // -check <triplets>
+    int          checkTol = 20;         // -tol N (default 20)
+    int          gridW = 0, gridH = 0;  // -grid WxH (0 = off)
+    int          resizeW = 0, resizeH = 0;  // -resize WxH (0 = off)
+    int          cropX = 0, cropY = 0, cropW = 0, cropH = 0;  // -crop X,Y,W,H
 
     // Parse command-line arguments.
     for (int i = 1; i < argc; i++)
@@ -734,6 +952,59 @@ int main(int argc, char* argv[])
             MultiByteToWideChar(CP_UTF8, 0, argv[i + 1], -1, buffer, len);
             inspectFile = buffer;
             delete[] buffer;
+            i++;
+        }
+        else if (arg == "-check" && i + 1 < argc)
+        {
+            checkSpec = argv[i + 1];
+            i++;
+        }
+        else if (arg == "-grid" && i + 1 < argc)
+        {
+            if (sscanf_s(argv[i + 1], "%dx%d", &gridW, &gridH) != 2 ||
+                gridW <= 0 || gridH <= 0) {
+                std::cerr << "[ERROR] -grid expects WxH (e.g. -grid 24x20)\n";
+                return -1;
+            }
+            i++;
+        }
+        else if (arg == "-resize" && i + 1 < argc)
+        {
+            if (sscanf_s(argv[i + 1], "%dx%d", &resizeW, &resizeH) != 2 ||
+                resizeW <= 0 || resizeH <= 0) {
+                std::cerr << "[ERROR] -resize expects WxH (e.g. -resize 1280x720)\n";
+                return -1;
+            }
+            i++;
+        }
+        else if (arg == "-crop" && i + 1 < argc)
+        {
+            if (sscanf_s(argv[i + 1], "%d,%d,%d,%d", &cropX, &cropY, &cropW, &cropH) != 4 ||
+                cropW <= 0 || cropH <= 0) {
+                std::cerr << "[ERROR] -crop expects X,Y,W,H (e.g. -crop 100,50,400,300)\n";
+                return -1;
+            }
+            i++;
+        }
+        else if (arg == "-tol" && i + 1 < argc)
+        {
+            checkTol = std::atoi(argv[i + 1]);
+            i++;
+        }
+        else if (arg == "-base" && i + 1 < argc)
+        {
+            // -base X,Y — inspect mode subtracts (X,Y) from emitted coords
+            // so the dx,dy values are cell-relative. Lets the same digit
+            // fingerprint apply at any screen position.
+            int bx = 0, by = 0;
+            if (sscanf_s(argv[i + 1], "%d,%d", &bx, &by) == 2) {
+                g_insp.baseX = bx;
+                g_insp.baseY = by;
+                g_insp.baseSet = true;
+            } else {
+                std::cerr << "[ERROR] -base expects X,Y (e.g. -base 100,200)\n";
+                return -1;
+            }
             i++;
         }
         else if (arg == "-p")
@@ -864,7 +1135,41 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    // -inspect short-circuits the capture pipeline.
+    // -inspect short-circuits the capture pipeline.  -check on its own
+    // also short-circuits (batch verify, no window).  -check needs a
+    // file too — reuse -inspect's path arg.
+    if (!checkSpec.empty())
+    {
+        if (inspectFile.empty()) {
+            std::cerr << "[ERROR] -check requires -inspect <file> to know which image to read.\n";
+            GdiplusShutdown(gdiplusToken);
+            return 1;
+        }
+        int rc = runCheckMode(inspectFile, checkSpec, checkTol);
+        GdiplusShutdown(gdiplusToken);
+        return rc;
+    }
+    if (gridW > 0 && gridH > 0)
+    {
+        if (inspectFile.empty()) {
+            std::cerr << "[ERROR] -grid requires -inspect <file> to know which image to read.\n";
+            GdiplusShutdown(gdiplusToken);
+            return 1;
+        }
+        int rc = runGridMode(inspectFile, gridW, gridH);
+        GdiplusShutdown(gdiplusToken);
+        return rc;
+    }
+    // Preprocess: -resize and/or -crop applied to an -inspect <input>, written to -f <output>.
+    if (!inspectFile.empty() && (resizeW > 0 || cropW > 0))
+    {
+        std::wstring outPath = outputFile;
+        if (!outputDir.empty()) outPath = outputDir + L"\\" + outputFile;
+        int rc = runPreprocessMode(inspectFile, outPath,
+            resizeW, resizeH, cropX, cropY, cropW, cropH);
+        GdiplusShutdown(gdiplusToken);
+        return rc;
+    }
     if (!inspectFile.empty())
     {
         int rc = runInspectMode(inspectFile);
