@@ -18,11 +18,13 @@
 #include <shellscalingapi.h>  // For DPI functions
 #include <iostream>
 #include <sstream>
+#include <fstream>
 #include <vector>
 #include <string>
 #include <iomanip>
 #include <ctime>
 #include <algorithm>
+#include <map>
 #include <chrono>
 #include <thread>
 
@@ -269,6 +271,13 @@ void printUsage()
         << "                        (use -1 for \"no match expected\"). Prints per-row\n"
         << "                        PASS/FAIL. Exit 0 if all pass, 1 otherwise. Pair with\n"
         << "                        -inspect <image> and -tol N (default 20).\n"
+        << "  -ocr_build \"x,y=d ...\"  Build a fingerprint table from labeled digit\n"
+        << "                        positions.  Picks the 3 best discriminating offsets\n"
+        << "                        per digit (max min-channel-distance to other digits)\n"
+        << "                        and emits ready-to-paste C++ + asm table entries.\n"
+        << "                        Pair with -inspect <image>.\n"
+        << "  -ocr_build_file <path>  Same as -ocr_build but reads spec from a text file\n"
+        << "                        (avoids cmd/bash quoting issues for long specs).\n"
         << "  -ocr_scan \"X1,Y1,X2,Y2\" Auto-detect: walk every (x,y) in the rectangle,\n"
         << "                        run the OCR walker. On match, print \"(x,y) digit=N\"\n"
         << "                        and advance x by the matched entry's width to avoid\n"
@@ -841,6 +850,238 @@ static int runOcrTestMode(const std::wstring& filePath, const std::string& spec,
     return (passes == rows) ? 0 : 1;
 }
 
+// -ocr_build "x,y=d x,y=d ..."
+// Given labeled digit positions, picks 3 best discriminating fingerprint
+// offsets per digit and emits ready-to-paste table entries in both C++
+// (g_digit_table[]) and asm (cf22's ocr_table) form.  Heuristic: per
+// digit, score each candidate offset by its MIN color-channel distance
+// to every OTHER digit's averaged color at the same offset — bigger
+// means harder to confuse.  Top 3 wins.  Colors are averaged across all
+// labeled instances of the same digit to soak up jitter / anti-alias
+// noise.  Cell box = 14x22 (covers the typical 12-16 px digit + a few
+// pixels of breathing room either side).
+static int runOcrBuildMode(const std::wstring& filePath, const std::string& spec)
+{
+    g_insp.image = Gdiplus::Bitmap::FromFile(filePath.c_str());
+    if (!g_insp.image || g_insp.image->GetLastStatus() != Gdiplus::Ok) {
+        std::wcerr << L"[ERROR] Could not load image: " << filePath << std::endl;
+        return 1;
+    }
+    g_insp.imgW = g_insp.image->GetWidth();
+    g_insp.imgH = g_insp.image->GetHeight();
+
+    // Parse spec: collect per-digit positions.
+    std::map<int, std::vector<std::pair<int,int>>> positions;
+    {
+        std::istringstream iss(spec);
+        std::string token;
+        while (iss >> token) {
+            int x = 0, y = 0, d = 0;
+            if (sscanf_s(token.c_str(), "%d,%d=%d", &x, &y, &d) != 3 ||
+                d < 0 || d > 9) {
+                fprintf(stderr, "[ERROR] bad label: %s (want x,y=d with d in 0..9)\n", token.c_str());
+                return 1;
+            }
+            positions[d].push_back({x, y});
+        }
+    }
+    if (positions.empty()) {
+        fprintf(stderr, "[ERROR] no labels parsed from spec\n");
+        return 1;
+    }
+
+    const int CW = 14, CH = 22;
+    const int N = CW * CH;
+
+    // Average color per (digit, offset) across all instances of digit.
+    // Store as 0xRRGGBB.
+    std::map<int, std::vector<unsigned>> avgColor;
+    for (auto it = positions.begin(); it != positions.end(); ++it) {
+        int d = it->first;
+        const std::vector<std::pair<int,int>>& posns = it->second;
+        std::vector<unsigned> avg(N, 0);
+        for (int i = 0; i < N; ++i) {
+            int dx = i % CW;
+            int dy = i / CW;
+            long long sR = 0, sG = 0, sB = 0;
+            for (size_t p = 0; p < posns.size(); ++p) {
+                COLORREF c = inspReadPixel(posns[p].first + dx, posns[p].second + dy);
+                sR += (c & 0xFF);
+                sG += ((c >> 8) & 0xFF);
+                sB += ((c >> 16) & 0xFF);
+            }
+            int n = (int)posns.size();
+            int r = (int)(sR / n), g = (int)(sG / n), b = (int)(sB / n);
+            avg[i] = (r << 16) | (g << 8) | b;
+        }
+        avgColor[d] = avg;
+    }
+
+    int labelCount = 0;
+    for (auto it = positions.begin(); it != positions.end(); ++it)
+        labelCount += (int)it->second.size();
+    printf("[OCR_BUILD] %d labels covering %d distinct digit(s), cell=%dx%d\n",
+           labelCount, (int)positions.size(), CW, CH);
+
+    // Per-(digit, offset) max-channel deviation across instances.  An
+    // offset where one instance reads dramatically off-average can't
+    // discriminate via a single COLORREF — picking it would fail the
+    // self-test.  Use this to filter unstable offsets before scoring.
+    const int INSTANCE_VAR_LIMIT = 12;   // < SELF_TOL=15, with margin
+    std::map<int, std::vector<int>> maxDev;
+    for (auto it = positions.begin(); it != positions.end(); ++it) {
+        int d = it->first;
+        const std::vector<std::pair<int,int>>& posns = it->second;
+        std::vector<int> dev(N, 0);
+        for (int i = 0; i < N; ++i) {
+            int dx = i % CW;
+            int dy = i / CW;
+            // Mean stored as 0xRRGGBB.
+            int meanR = (avgColor[d][i] >> 16) & 0xFF;
+            int meanG = (avgColor[d][i] >> 8)  & 0xFF;
+            int meanB =  avgColor[d][i]        & 0xFF;
+            int maxD = 0;
+            for (size_t p = 0; p < posns.size(); ++p) {
+                COLORREF c = inspReadPixel(posns[p].first + dx, posns[p].second + dy);
+                int rDiff = abs((int)(c & 0xFF) - meanR);
+                int gDiff = abs((int)((c >> 8) & 0xFF) - meanG);
+                int bDiff = abs((int)((c >> 16) & 0xFF) - meanB);
+                int chanMax = (std::max)((std::max)(rDiff, gDiff), bDiff);
+                if (chanMax > maxD) maxD = chanMax;
+            }
+            dev[i] = maxD;
+        }
+        maxDev[d] = dev;
+    }
+
+    // For each digit D, pick the 3 offsets with the largest MIN distance
+    // to any other digit's color at that offset.  Tie-break by offset
+    // index for determinism.
+    auto pickOffsets = [&](int d) -> std::vector<int> {
+        const std::vector<unsigned>& mine = avgColor[d];
+        const std::vector<int>& dev = maxDev[d];
+        std::vector<std::pair<int,int>> scored;   // (score, offset)
+        scored.reserve(N);
+        int rejectedByVariance = 0;
+        for (int i = 0; i < N; ++i) {
+            if (dev[i] > INSTANCE_VAR_LIMIT) {
+                rejectedByVariance++;
+                continue;   // unstable across instances, would fail self-test
+            }
+            int dr = (mine[i] >> 16) & 0xFF;
+            int dg = (mine[i] >> 8) & 0xFF;
+            int db = mine[i] & 0xFF;
+            int minDist = 9999;
+            for (auto jt = avgColor.begin(); jt != avgColor.end(); ++jt) {
+                if (jt->first == d) continue;
+                unsigned oc = jt->second[i];
+                int orr = (oc >> 16) & 0xFF;
+                int og = (oc >> 8) & 0xFF;
+                int ob = oc & 0xFF;
+                int dist = (std::max)((std::max)(abs(dr - orr), abs(dg - og)), abs(db - ob));
+                if (dist < minDist) minDist = dist;
+            }
+            scored.push_back({minDist, i});
+        }
+        if ((int)scored.size() < 3) {
+            fprintf(stderr,
+                "[WARN] '%d' has only %d stable offsets (%d rejected by variance>%d) — "
+                "may need more samples or wider INSTANCE_VAR_LIMIT.\n",
+                d, (int)scored.size(), rejectedByVariance, INSTANCE_VAR_LIMIT);
+        }
+        std::sort(scored.begin(), scored.end(),
+                  [](const std::pair<int,int>& a, const std::pair<int,int>& b) {
+                      if (a.first != b.first) return a.first > b.first;
+                      return a.second < b.second;
+                  });
+        std::vector<int> picked(3);
+        for (int j = 0; j < 3 && j < (int)scored.size(); ++j) picked[j] = scored[j].second;
+        printf("    '%d': top scores %d, %d, %d  (%d stable / %d rejected)\n",
+               d,
+               (int)scored.size() > 0 ? scored[0].first : -1,
+               (int)scored.size() > 1 ? scored[1].first : -1,
+               (int)scored.size() > 2 ? scored[2].first : -1,
+               (int)scored.size(), rejectedByVariance);
+        return picked;
+    };
+
+    std::map<int, std::vector<int>> picks;
+    printf("\n[OCR_BUILD] per-digit discrimination:\n");
+    for (auto it = avgColor.begin(); it != avgColor.end(); ++it)
+        picks[it->first] = pickOffsets(it->first);
+
+    // Emit C++ entries.
+    printf("\n// === C++ entries (paste into g_digit_table[]) ===\n");
+    for (auto it = picks.begin(); it != picks.end(); ++it) {
+        int d = it->first;
+        const std::vector<int>& p = it->second;
+        const std::vector<unsigned>& c = avgColor[d];
+        printf("    { %d, {%d,%d,%d}, {%d,%d,%d}, {0x%06X, 0x%06X, 0x%06X}, 13 },\n",
+               d,
+               p[0] % CW, p[1] % CW, p[2] % CW,
+               p[0] / CW, p[1] / CW, p[2] / CW,
+               c[p[0]], c[p[1]], c[p[2]]);
+    }
+
+    // Emit asm entries (cf22 layout: digit, 3x(dx,dy,color), width).
+    printf("\n; === asm entries (paste into ocr_table) ===\n");
+    for (auto it = picks.begin(); it != picks.end(); ++it) {
+        int d = it->first;
+        const std::vector<int>& p = it->second;
+        const std::vector<unsigned>& c = avgColor[d];
+        printf("    dd %d, %d, %d, 0%06Xh, %d, %d, 0%06Xh, %d, %d, 0%06Xh, 13   ; '%d'\n",
+               d,
+               p[0] % CW, p[0] / CW, c[p[0]],
+               p[1] % CW, p[1] / CW, c[p[1]],
+               p[2] % CW, p[2] / CW, c[p[2]],
+               d);
+    }
+
+    // In-memory self-test: walk each label and verify the freshly-built
+    // fingerprint identifies it (using the same algorithm shape as
+    // ocrDigitAt — just check the matching digit's 3 picked offsets
+    // with tol=15 and accept on success).  Reports which labels would
+    // not have round-tripped through the built table.
+    const int SELF_TOL = 15;
+    printf("\n[OCR_BUILD] self-test (tol=%d):\n", SELF_TOL);
+    int rows = 0, passes = 0;
+    for (auto it = positions.begin(); it != positions.end(); ++it) {
+        int d = it->first;
+        const std::vector<int>& p = picks[d];
+        const std::vector<unsigned>& c = avgColor[d];
+        for (size_t pi = 0; pi < it->second.size(); ++pi) {
+            int bx = it->second[pi].first;
+            int by = it->second[pi].second;
+            bool ok = true;
+            for (int k = 0; k < 3; ++k) {
+                int dx = p[k] % CW;
+                int dy = p[k] / CW;
+                COLORREF got = inspReadPixel(bx + dx, by + dy);
+                int got_r = got & 0xFF;
+                int got_g = (got >> 8) & 0xFF;
+                int got_b = (got >> 16) & 0xFF;
+                int want_b = c[p[k]] & 0xFF;
+                int want_g = (c[p[k]] >> 8) & 0xFF;
+                int want_r = (c[p[k]] >> 16) & 0xFF;
+                if (abs(got_r - want_r) > SELF_TOL ||
+                    abs(got_g - want_g) > SELF_TOL ||
+                    abs(got_b - want_b) > SELF_TOL) {
+                    ok = false;
+                    break;
+                }
+            }
+            printf("  (%d,%d)='%d' %s\n", bx, by, d, ok ? "PASS" : "FAIL");
+            rows++;
+            if (ok) passes++;
+        }
+    }
+    printf("[OCR_BUILD] self-test: %d/%d labels round-trip cleanly\n", passes, rows);
+
+    delete g_insp.image;
+    g_insp.image = nullptr;
+    return (passes == rows) ? 0 : 1;
+}
+
 static int runInspectMode(const std::wstring& filePath)
 {
     g_insp.image = Gdiplus::Bitmap::FromFile(filePath.c_str());
@@ -1111,6 +1352,7 @@ int main(int argc, char* argv[])
     int          cropX = 0, cropY = 0, cropW = 0, cropH = 0;  // -crop X,Y,W,H
     std::string  ocrTestSpec;            // -ocr_test "<assertions>"
     std::string  ocrScanSpec;            // -ocr_scan "X1,Y1,X2,Y2"
+    std::string  ocrBuildSpec;           // -ocr_build "x,y=d x,y=d ..."
 
     // Parse command-line arguments.
     for (int i = 1; i < argc; i++)
@@ -1275,6 +1517,25 @@ int main(int argc, char* argv[])
         else if (arg == "-ocr_scan" && i + 1 < argc)
         {
             ocrScanSpec = argv[i + 1];
+            i++;
+        }
+        else if (arg == "-ocr_build" && i + 1 < argc)
+        {
+            ocrBuildSpec = argv[i + 1];
+            i++;
+        }
+        else if (arg == "-ocr_build_file" && i + 1 < argc)
+        {
+            // Read spec from a text file — avoids the cmd.exe/bash
+            // round-trip eating spaces in long -ocr_build strings.
+            std::ifstream fin(argv[i + 1]);
+            if (!fin) {
+                fprintf(stderr, "[ERROR] -ocr_build_file: cannot open %s\n", argv[i + 1]);
+                return 1;
+            }
+            std::stringstream ss;
+            ss << fin.rdbuf();
+            ocrBuildSpec = ss.str();
             i++;
         }
         else if (arg == "-tol" && i + 1 < argc)
@@ -1474,6 +1735,17 @@ int main(int argc, char* argv[])
             return 1;
         }
         int rc = runOcrScanMode(inspectFile, ocrScanSpec, checkTol);
+        GdiplusShutdown(gdiplusToken);
+        return rc;
+    }
+    if (!ocrBuildSpec.empty())
+    {
+        if (inspectFile.empty()) {
+            std::cerr << "[ERROR] -ocr_build requires -inspect <file> to know which image to read.\n";
+            GdiplusShutdown(gdiplusToken);
+            return 1;
+        }
+        int rc = runOcrBuildMode(inspectFile, ocrBuildSpec);
         GdiplusShutdown(gdiplusToken);
         return rc;
     }
