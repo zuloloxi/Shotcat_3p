@@ -686,6 +686,10 @@ static const OcrFP g_digit_table[] = {
     { 3, {3,0,5}, {14,18,26}, {0xFEFEFE, 0x0D0D0D, 0xFFFFFF}, 18 },
     // '8' at base (1770,94) — upper body, narrow waist, lower body
     { 8, {3,1,5}, {16,19,26}, {0xFFFFFF, 0x41403F, 0xFFFFFF}, 18 },
+    // '6' = '9' rotated 180 degrees — offsets mirrored through cell
+    // center (6.5, 20.5), same anti-aliased colors. Most fonts make
+    // 6 and 9 rotationally symmetric.
+    { 6, {7,5,1}, {24,24,27}, {0x1C1D1D, 0xFEFEFE, 0x383B3A}, 18 },
 };
 static const int g_digit_table_count =
     sizeof(g_digit_table) / sizeof(g_digit_table[0]);
