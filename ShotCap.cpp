@@ -227,7 +227,9 @@ void printUsage()
         << "  -select               Interactively select a region with the mouse\n"
         << "  -format <format>      Image format: png, jpg, bmp (default: png)\n"
         << "  -quality <0-100>      JPEG quality (only for -format jpg, default: 90)\n"
-        << "  -w <window_title>     Capture a specific window by its title\n"
+        << "  -w <substring>        Capture window whose title CONTAINS <substring>\n"
+        << "                        (substring match, first hit by z-order).  E.g.\n"
+        << "                        -w \"Bluestack\" matches an Edge tab with a long title.\n"
         << "  -active               Capture the active (foreground) window\n"
         << "  -m <monitor_index>    Capture a specific monitor (0-based index)\n"
         << "  -clipboard            Copy captured image to clipboard\n"
@@ -926,12 +928,83 @@ BOOL CALLBACK EnumWindowsProc(HWND hWnd, LPARAM lParam)
 {
     ListWinCtx* ctx = reinterpret_cast<ListWinCtx*>(lParam);
     if (ctx->limit > 0 && ctx->count >= ctx->limit) return FALSE;
-    wchar_t title[256] = { 0 };
-    GetWindowTextW(hWnd, title, 256);
+    wchar_t title[512] = { 0 };
+    GetWindowTextW(hWnd, title, 512);
     if (wcslen(title) == 0) return TRUE;
     *ctx->ss << L"Handle: " << hWnd << L" | Title: " << title << std::endl;
     ctx->count++;
     return TRUE;
+}
+
+// EnumWindows + substring match for -w "<needle>": frees the user from
+// pasting the exact (often unicode-laden) full title.  Picks the
+// LARGEST on-screen match — not first-in-z-order — because filenames
+// often leak into other apps' window titles (MSPaint, browser tabs,
+// editors) and those minimized helpers can otherwise outrank the
+// real target.  Filters out offscreen / minimized / tiny windows.
+struct FindByPartialCtx {
+    const wchar_t* needle;
+    HWND found;
+    int bestArea;
+};
+static BOOL CALLBACK FindByPartialProc(HWND h, LPARAM lp)
+{
+    FindByPartialCtx* ctx = reinterpret_cast<FindByPartialCtx*>(lp);
+    wchar_t title[512] = { 0 };
+    GetWindowTextW(h, title, 512);
+    if (!title[0] || !wcsstr(title, ctx->needle)) return TRUE;
+
+    // For minimized windows, GetWindowRect returns the taskbar-thumb
+    // rect (-32000,-32000,160x28).  Use GetWindowPlacement's
+    // rcNormalPosition to get the *restore* size — that's the real
+    // window size, and it outranks MSPaint/Edge taskbar-thumb proxies
+    // whose normal-position is also tiny.
+    RECT r;
+    WINDOWPLACEMENT wp = { sizeof(wp) };
+    if (GetWindowPlacement(h, &wp) && wp.showCmd == SW_SHOWMINIMIZED) {
+        r = wp.rcNormalPosition;
+    } else if (!GetWindowRect(h, &r)) {
+        return TRUE;
+    }
+    int w = r.right - r.left;
+    int hgt = r.bottom - r.top;
+    if (w < 100 || hgt < 100) return TRUE;
+
+    int area = w * hgt;
+    if (area > ctx->bestArea) {
+        ctx->bestArea = area;
+        ctx->found = h;
+    }
+    return TRUE;   // keep searching for a larger match
+}
+static HWND findWindowBySubstring(const std::wstring& needle)
+{
+    FindByPartialCtx ctx{ needle.c_str(), nullptr, 0 };
+    EnumWindows(FindByPartialProc, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.found;
+}
+
+// std::wcout enters a fail state mid-stream when a wide char can't be
+// encoded in the active codepage (Edge/Chrome titles contain em-dashes,
+// special unicode); after that, all subsequent writes are silently
+// dropped.  WriteConsoleW writes UTF-16 directly to the console and is
+// immune.  Use this for any output that may contain user-supplied or
+// foreign text — currently the -listwindows / -listallwindows dumps.
+static void writeWideToConsole(const std::wstring& s)
+{
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD written = 0;
+    DWORD mode = 0;
+    if (GetConsoleMode(h, &mode)) {
+        WriteConsoleW(h, s.c_str(), static_cast<DWORD>(s.size()), &written, NULL);
+    } else {
+        // Not a console (redirected to file/pipe): emit UTF-8.
+        int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0, NULL, NULL);
+        std::string buf(n, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), &buf[0], n, NULL, NULL);
+        DWORD wb = 0;
+        WriteFile(h, buf.data(), (DWORD)buf.size(), &wb, NULL);
+    }
 }
 
 //---------------------------------------------------------------------
@@ -999,6 +1072,12 @@ int main(int argc, char* argv[])
     if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
         SetProcessDPIAware();
     // --------------------------------
+
+    // UTF-8 console output — Edge/Chrome tab titles contain em-dashes
+    // and other unicode that the default codepage can't encode; without
+    // this, std::wcout enters a fail state mid-stream and -listwindows
+    // silently truncates after the first un-encodable title.
+    SetConsoleOutputCP(CP_UTF8);
 
     // Default parameters.
     std::wstring outputFile = L"screenshot.png";
@@ -1294,17 +1373,21 @@ int main(int argc, char* argv[])
         std::wstringstream ss;
         ListWinCtx ctx { &ss, listWindowsLimit, 0 };
         EnumWindows(EnumWindowsProc, (LPARAM)&ctx);
-        std::wcout << L"Visible windows";
+        std::wstringstream header;
+        header << L"Visible windows";
         if (listWindowsLimit > 0)
-            std::wcout << L" (top " << ctx.count << L" of cap " << listWindowsLimit << L")";
-        std::wcout << L":\n" << ss.str();
+            header << L" (top " << ctx.count << L" of cap " << listWindowsLimit << L")";
+        header << L":\n";
+        writeWideToConsole(header.str());
+        writeWideToConsole(ss.str());
         return 0;
     }
     if (listAllWindows)
     {
         std::wstringstream ss;
         EnumWindows(EnumAllWindowsProc, (LPARAM)&ss);
-        std::wcout << L"All top-level windows (V=visible, H=hidden):\n" << ss.str();
+        writeWideToConsole(L"All top-level windows (V=visible, H=hidden):\n");
+        writeWideToConsole(ss.str());
         return 0;
     }
 
@@ -1420,11 +1503,20 @@ int main(int argc, char* argv[])
             // For active window or specified window, use PrintWindow.
             if (captureActiveWindow || !windowTitle.empty())
             {
-                HWND hWnd = captureActiveWindow ? GetForegroundWindow() : FindWindowW(NULL, windowTitle.c_str());
+                HWND hWnd = captureActiveWindow ? GetForegroundWindow() : findWindowBySubstring(windowTitle);
                 if (!hWnd)
                 {
                     std::wcerr << L"Window not found." << std::endl;
                     return false;
+                }
+                // Restore + bring to front if minimized — otherwise
+                // GetWindowRect returns the taskbar-thumb 160x28 rect
+                // and PrintWindow captures nothing useful.
+                if (IsIconic(hWnd))
+                {
+                    ShowWindow(hWnd, SW_RESTORE);
+                    SetForegroundWindow(hWnd);
+                    Sleep(250);   // let WM_SIZE / repaint settle
                 }
                 if (verbose)
                     std::wcout << L"[INFO] Capturing window." << std::endl;
@@ -1527,7 +1619,7 @@ int main(int argc, char* argv[])
             // For window capture, try using PrintWindow.
             if (captureActiveWindow || !windowTitle.empty())
             {
-                HWND hWnd = captureActiveWindow ? GetForegroundWindow() : FindWindowW(NULL, windowTitle.c_str());
+                HWND hWnd = captureActiveWindow ? GetForegroundWindow() : findWindowBySubstring(windowTitle);
                 BOOL printResult = PrintWindow(hWnd, hCaptureDC, PW_RENDERFULLCONTENT);
                 if (!printResult)
                 {
