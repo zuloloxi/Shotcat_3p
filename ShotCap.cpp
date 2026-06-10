@@ -262,6 +262,11 @@ void printUsage()
         << "                        reference resolution before OCR (e.g. 1280x720).\n"
         << "  -crop X,Y,W,H         Preprocess: extract a sub-rect of -inspect <input> and\n"
         << "                        save as -f <output>. Crop runs BEFORE -resize.\n"
+        << "  -ocr_test \"<asserts>\"  Run the built-in 3-pixel OCR algorithm at each (x,y)\n"
+        << "                        in a space-separated list of \"x,y=expected_digit\" pairs\n"
+        << "                        (use -1 for \"no match expected\"). Prints per-row\n"
+        << "                        PASS/FAIL. Exit 0 if all pass, 1 otherwise. Pair with\n"
+        << "                        -inspect <image> and -tol N (default 20).\n"
         << "  -vl                   Enable verbose logging\n"
         << "  -v, --version         Show current shotcap version\n"
         << "  -h, --help            Display this help message\n";
@@ -639,6 +644,100 @@ static int runPreprocessMode(const std::wstring& inFile,
     return 0;
 }
 
+// --- OCR test harness ------------------------------------------------
+// Built-in 3-pixel-fingerprint table.  Each entry: digit value, 3
+// (dx,dy,expected_color_RRGGBB), width.  Walks the table on each call,
+// returning the first digit whose 3 fingerprint pixels all fall within
+// -tol per-channel of expected.  This is the C++ prototype of the
+// algorithm we'll port to color_iw.asm once we've validated it here.
+//
+// Current table (calibrated against tests/coc1.png, "2 942 057" gold
+// counter at top-right): digits 2, 9, 4.
+struct OcrFP {
+    int digit;
+    int dx[3], dy[3];
+    unsigned c[3];   // 0xRRGGBB
+    int width;
+};
+static const OcrFP g_digit_table[] = {
+    // '2': top-left-of-top-bar=W, mid-of-right-side-empty=dark, bottom-left-of-bottom-bar=W
+    { 2, {1,8,1}, {14,23,26}, {0xFFFFFF, 0x000000, 0xFFFFFF}, 18 },
+    // '9': interior-of-upper-loop=dark, right-of-loop=W, top-right-corner-empty=dark
+    { 9, {6,8,12}, {17,17,14}, {0x000000, 0xFFFFFF, 0x000000}, 18 },
+    // '4': cross-bar=W, lower-right-vertical=W, upper-left-hole=dark
+    { 4, {3,12,2}, {23,26,19}, {0xFFFFFF, 0xFFFFFF, 0x000000}, 18 },
+};
+static const int g_digit_table_count =
+    sizeof(g_digit_table) / sizeof(g_digit_table[0]);
+
+// Returns the digit at (bx,by) per the table, or -1 if no fingerprint
+// matches.  pix3 = 3-pixel COLORREF compare against want with abs-diff
+// <= tol per channel.
+//
+// Jitter retry: each digit is tried at x, x-1, x+1 before moving to
+// the next digit.  Mirrors the original sequential scanner's pattern;
+// absorbs sub-pixel drift from JPEG compression / anti-alias variation
+// without expanding the table.
+static int ocrDigitAt(int bx, int by, int tol)
+{
+    static const int kJitter[3] = { 0, -1, +1 };
+    for (int i = 0; i < g_digit_table_count; ++i) {
+        const OcrFP& fp = g_digit_table[i];
+        for (int j = 0; j < 3; ++j) {
+            int xj = bx + kJitter[j];
+            bool all_ok = true;
+            for (int p = 0; p < 3; ++p) {
+                COLORREF got = inspReadPixel(xj + fp.dx[p], by + fp.dy[p]);
+                unsigned want = fp.c[p];
+                // got is 0x00BBGGRR; want is 0xRRGGBB.  Flip want for diff.
+                unsigned want_bgr = ((want & 0xFF) << 16) | (want & 0xFF00) | ((want >> 16) & 0xFF);
+                int dR = abs((int)((got >> 0) & 0xFF) - (int)((want_bgr >> 0) & 0xFF));
+                int dG = abs((int)((got >> 8) & 0xFF) - (int)((want_bgr >> 8) & 0xFF));
+                int dB = abs((int)((got >> 16) & 0xFF) - (int)((want_bgr >> 16) & 0xFF));
+                if (dR > tol || dG > tol || dB > tol) { all_ok = false; break; }
+            }
+            if (all_ok) return fp.digit;
+        }
+    }
+    return -1;
+}
+
+// -ocr_test "x1,y1=d1 x2,y2=d2 ..."
+// Walks each assertion, runs ocrDigitAt at (x,y), compares to expected
+// digit (use -1 for "no match expected").  Prints per-row PASS/FAIL.
+// Exit 0 if all pass, 1 if any fail.
+static int runOcrTestMode(const std::wstring& filePath, const std::string& spec, int tol)
+{
+    g_insp.image = Gdiplus::Bitmap::FromFile(filePath.c_str());
+    if (!g_insp.image || g_insp.image->GetLastStatus() != Gdiplus::Ok) {
+        std::wcerr << L"[ERROR] Could not load image: " << filePath << std::endl;
+        return 1;
+    }
+    g_insp.imgW = g_insp.image->GetWidth();
+    g_insp.imgH = g_insp.image->GetHeight();
+    printf("[OCR_TEST] tol=%d table=%d digits\n", tol, g_digit_table_count);
+    int rows = 0, passes = 0;
+    std::istringstream iss(spec);
+    std::string token;
+    while (iss >> token) {
+        int x = 0, y = 0, expected = 0;
+        if (sscanf_s(token.c_str(), "%d,%d=%d", &x, &y, &expected) != 3) {
+            fprintf(stderr, "[ERROR] bad assertion: %s (want x,y=digit_or_-1)\n", token.c_str());
+            return 1;
+        }
+        int got = ocrDigitAt(x, y, tol);
+        bool ok = (got == expected);
+        printf("  (%d,%d) got=%-2d expected=%-2d %s\n", x, y, got, expected,
+            ok ? "PASS" : "FAIL");
+        rows++;
+        if (ok) passes++;
+    }
+    printf("[OCR_TEST] %d/%d passed\n", passes, rows);
+    delete g_insp.image;
+    g_insp.image = nullptr;
+    return (passes == rows) ? 0 : 1;
+}
+
 static int runInspectMode(const std::wstring& filePath)
 {
     g_insp.image = Gdiplus::Bitmap::FromFile(filePath.c_str());
@@ -830,6 +929,7 @@ int main(int argc, char* argv[])
     int          gridW = 0, gridH = 0;  // -grid WxH (0 = off)
     int          resizeW = 0, resizeH = 0;  // -resize WxH (0 = off)
     int          cropX = 0, cropY = 0, cropW = 0, cropH = 0;  // -crop X,Y,W,H
+    std::string  ocrTestSpec;            // -ocr_test "<assertions>"
 
     // Parse command-line arguments.
     for (int i = 1; i < argc; i++)
@@ -984,6 +1084,11 @@ int main(int argc, char* argv[])
                 std::cerr << "[ERROR] -crop expects X,Y,W,H (e.g. -crop 100,50,400,300)\n";
                 return -1;
             }
+            i++;
+        }
+        else if (arg == "-ocr_test" && i + 1 < argc)
+        {
+            ocrTestSpec = argv[i + 1];
             i++;
         }
         else if (arg == "-tol" && i + 1 < argc)
@@ -1157,6 +1262,17 @@ int main(int argc, char* argv[])
             return 1;
         }
         int rc = runGridMode(inspectFile, gridW, gridH);
+        GdiplusShutdown(gdiplusToken);
+        return rc;
+    }
+    if (!ocrTestSpec.empty())
+    {
+        if (inspectFile.empty()) {
+            std::cerr << "[ERROR] -ocr_test requires -inspect <file> to know which image to read.\n";
+            GdiplusShutdown(gdiplusToken);
+            return 1;
+        }
+        int rc = runOcrTestMode(inspectFile, ocrTestSpec, checkTol);
         GdiplusShutdown(gdiplusToken);
         return rc;
     }
