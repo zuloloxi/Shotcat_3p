@@ -674,6 +674,12 @@ static const OcrFP g_digit_table[] = {
     { 9, {6,8,12}, {17,17,14}, {0x1C1D1D, 0xFEFEFE, 0x383B3A}, 18 },
     // '4' at base (1716,22)
     { 4, {3,12,2}, {23,26,19}, {0xFFFFFF, 0xFCFCFC, 0x303131}, 18 },
+    // '0' at base (1748,22) — left wall, hollow center, right wall
+    { 0, {0,5,12}, {21,21,21}, {0xFFFFFF, 0x2F2F30, 0xFFFFFF}, 18 },
+    // '5' at base (1762,22) — top stroke, dark gap after vertical, body left
+    { 5, {4,10,4}, {14,17,25}, {0xFFFFFF, 0x181818, 0xB0B1B1}, 18 },
+    // '7' at base (1775,22) — no upper-left body, diagonal mid, dark lower-left
+    { 7, {1,5,2}, {18,22,26}, {0x2F3030, 0xEAEAEA, 0x2E2F2F}, 18 },
 };
 static const int g_digit_table_count =
     sizeof(g_digit_table) / sizeof(g_digit_table[0]);
