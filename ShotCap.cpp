@@ -267,6 +267,11 @@ void printUsage()
         << "                        (use -1 for \"no match expected\"). Prints per-row\n"
         << "                        PASS/FAIL. Exit 0 if all pass, 1 otherwise. Pair with\n"
         << "                        -inspect <image> and -tol N (default 20).\n"
+        << "  -ocr_scan \"X1,Y1,X2,Y2\" Auto-detect: walk every (x,y) in the rectangle,\n"
+        << "                        run the OCR walker. On match, print \"(x,y) digit=N\"\n"
+        << "                        and advance x by the matched entry's width to avoid\n"
+        << "                        dup-detection. Pair with -inspect <image>. Use this\n"
+        << "                        to discover digit base coords without manual hovering.\n"
         << "  -vl                   Enable verbose logging\n"
         << "  -v, --version         Show current shotcap version\n"
         << "  -h, --help            Display this help message\n";
@@ -660,12 +665,15 @@ struct OcrFP {
     int width;
 };
 static const OcrFP g_digit_table[] = {
-    // '2': top-left-of-top-bar=W, mid-of-right-side-empty=dark, bottom-left-of-bottom-bar=W
-    { 2, {1,8,1}, {14,23,26}, {0xFFFFFF, 0x000000, 0xFFFFFF}, 18 },
-    // '9': interior-of-upper-loop=dark, right-of-loop=W, top-right-corner-empty=dark
-    { 9, {6,8,12}, {17,17,14}, {0x000000, 0xFFFFFF, 0x000000}, 18 },
-    // '4': cross-bar=W, lower-right-vertical=W, upper-left-hole=dark
-    { 4, {3,12,2}, {23,26,19}, {0xFFFFFF, 0xFFFFFF, 0x000000}, 18 },
+    // Calibrated colors measured directly from tests/coc1.png — anti-
+    // aliased mid-grays for "dark" pixels rather than pure 0x000000.
+    // With tight tol the table discriminates without false positives.
+    // '2' at base (1680,22)
+    { 2, {1,8,1}, {14,23,26}, {0xFFFFFF, 0x19191A, 0xFFFFFF}, 18 },
+    // '9' at base (1698,22)
+    { 9, {6,8,12}, {17,17,14}, {0x1C1D1D, 0xFEFEFE, 0x383B3A}, 18 },
+    // '4' at base (1716,22)
+    { 4, {3,12,2}, {23,26,19}, {0xFFFFFF, 0xFCFCFC, 0x303131}, 18 },
 };
 static const int g_digit_table_count =
     sizeof(g_digit_table) / sizeof(g_digit_table[0]);
@@ -700,6 +708,83 @@ static int ocrDigitAt(int bx, int by, int tol)
         }
     }
     return -1;
+}
+
+// Helper: like ocrDigitAt but also returns the width of the matched
+// entry via *outWidth, so the scanner can advance by it cleanly.
+static int ocrDigitAtW(int bx, int by, int tol, int* outWidth)
+{
+    static const int kJitter[3] = { 0, -1, +1 };
+    for (int i = 0; i < g_digit_table_count; ++i) {
+        const OcrFP& fp = g_digit_table[i];
+        for (int j = 0; j < 3; ++j) {
+            int xj = bx + kJitter[j];
+            bool all_ok = true;
+            for (int p = 0; p < 3; ++p) {
+                COLORREF got = inspReadPixel(xj + fp.dx[p], by + fp.dy[p]);
+                unsigned want = fp.c[p];
+                unsigned want_bgr = ((want & 0xFF) << 16) | (want & 0xFF00) | ((want >> 16) & 0xFF);
+                int dR = abs((int)((got >> 0) & 0xFF) - (int)((want_bgr >> 0) & 0xFF));
+                int dG = abs((int)((got >> 8) & 0xFF) - (int)((want_bgr >> 8) & 0xFF));
+                int dB = abs((int)((got >> 16) & 0xFF) - (int)((want_bgr >> 16) & 0xFF));
+                if (dR > tol || dG > tol || dB > tol) { all_ok = false; break; }
+            }
+            if (all_ok) {
+                if (outWidth) *outWidth = fp.width;
+                return fp.digit;
+            }
+        }
+    }
+    if (outWidth) *outWidth = 1;   // miss: advance by 1
+    return -1;
+}
+
+// -ocr_scan "X1,Y1,X2,Y2"
+// Walks every (x, y) in the rectangle [X1..X2) x [Y1..Y2), running the
+// OCR walker at each position.  On a match, prints "(x,y) digit=N" and
+// advances x by the matched entry's width (avoids the same digit being
+// detected at jitter-adjacent positions).  On a miss, advances x by 1.
+// Output is a list of detected digits with their image positions — use
+// this to auto-discover digit base coordinates without manual hovering.
+static int runOcrScanMode(const std::wstring& filePath, const std::string& spec, int tol)
+{
+    g_insp.image = Gdiplus::Bitmap::FromFile(filePath.c_str());
+    if (!g_insp.image || g_insp.image->GetLastStatus() != Gdiplus::Ok) {
+        std::wcerr << L"[ERROR] Could not load image: " << filePath << std::endl;
+        return 1;
+    }
+    g_insp.imgW = g_insp.image->GetWidth();
+    g_insp.imgH = g_insp.image->GetHeight();
+    int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+    if (sscanf_s(spec.c_str(), "%d,%d,%d,%d", &x1, &y1, &x2, &y2) != 4) {
+        std::cerr << "[ERROR] -ocr_scan expects X1,Y1,X2,Y2 (e.g. -ocr_scan 1600,15,2000,40)\n";
+        return 1;
+    }
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
+    if (x2 > g_insp.imgW) x2 = g_insp.imgW;
+    if (y2 > g_insp.imgH) y2 = g_insp.imgH;
+    printf("[OCR_SCAN] rect=(%d,%d)-(%d,%d) tol=%d table=%d\n",
+        x1, y1, x2, y2, tol, g_digit_table_count);
+    int hits = 0;
+    for (int y = y1; y < y2; ++y) {
+        int x = x1;
+        while (x < x2) {
+            int width = 1;
+            int d = ocrDigitAtW(x, y, tol, &width);
+            if (d >= 0) {
+                printf("  (%d,%d) digit=%d width=%d\n", x, y, d, width);
+                hits++;
+                x += width;
+            } else {
+                x++;
+            }
+        }
+    }
+    printf("[OCR_SCAN] %d hit(s)\n", hits);
+    delete g_insp.image;
+    g_insp.image = nullptr;
+    return (hits > 0) ? 0 : 1;
 }
 
 // -ocr_test "x1,y1=d1 x2,y2=d2 ..."
@@ -925,11 +1010,12 @@ int main(int argc, char* argv[])
     bool interactiveSelect = false;
     std::wstring inspectFile;
     std::string  checkSpec;             // -check <triplets>
-    int          checkTol = 20;         // -tol N (default 20)
+    int          checkTol = 15;         // -tol N (default 15 — calibrated table tol)
     int          gridW = 0, gridH = 0;  // -grid WxH (0 = off)
     int          resizeW = 0, resizeH = 0;  // -resize WxH (0 = off)
     int          cropX = 0, cropY = 0, cropW = 0, cropH = 0;  // -crop X,Y,W,H
     std::string  ocrTestSpec;            // -ocr_test "<assertions>"
+    std::string  ocrScanSpec;            // -ocr_scan "X1,Y1,X2,Y2"
 
     // Parse command-line arguments.
     for (int i = 1; i < argc; i++)
@@ -1089,6 +1175,11 @@ int main(int argc, char* argv[])
         else if (arg == "-ocr_test" && i + 1 < argc)
         {
             ocrTestSpec = argv[i + 1];
+            i++;
+        }
+        else if (arg == "-ocr_scan" && i + 1 < argc)
+        {
+            ocrScanSpec = argv[i + 1];
             i++;
         }
         else if (arg == "-tol" && i + 1 < argc)
@@ -1273,6 +1364,17 @@ int main(int argc, char* argv[])
             return 1;
         }
         int rc = runOcrTestMode(inspectFile, ocrTestSpec, checkTol);
+        GdiplusShutdown(gdiplusToken);
+        return rc;
+    }
+    if (!ocrScanSpec.empty())
+    {
+        if (inspectFile.empty()) {
+            std::cerr << "[ERROR] -ocr_scan requires -inspect <file> to know which image to read.\n";
+            GdiplusShutdown(gdiplusToken);
+            return 1;
+        }
+        int rc = runOcrScanMode(inspectFile, ocrScanSpec, checkTol);
         GdiplusShutdown(gdiplusToken);
         return rc;
     }
