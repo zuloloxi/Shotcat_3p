@@ -713,7 +713,7 @@ static const OcrFP g_digit_table_modern[] = {
 // 19 labels covering all 10 digits 0..9 natively).  Self-test 19/19
 // PASS at tol=15.  Saved to tests/coc_B_table.out.
 static const OcrFP g_digit_table_pre[] = {
-    { 0, {7,7,7},    {9,8,7},    {0x151719, 0x101111, 0x0D0F0E}, 13 },
+    { 0, {7,7,12},   {9,8,1},    {0x151719, 0x101111, 0xA2A79F}, 13 },
     { 1, {7,6,7},    {1,1,2},    {0x1F241D, 0x12170F, 0x2D322B}, 13 },
     { 2, {9,10,9},   {12,12,8},  {0x73766F, 0x575A53, 0x50524D}, 13 },
     { 3, {2,3,10},   {9,9,5},    {0x64675B, 0x84867D, 0x686C5D}, 13 },
@@ -994,9 +994,20 @@ static int runOcrBuildMode(const std::wstring& filePath, const std::string& spec
         maxDev[d] = dev;
     }
 
-    // For each digit D, pick the 3 offsets with the largest MIN distance
-    // to any other digit's color at that offset.  Tie-break by offset
-    // index for determinism.
+    // Picker — two-stage:
+    //   (1) per-offset scoring as before (variance-filtered, ranked by
+    //       min channel distance to any other digit's MEAN color).
+    //   (2) combinatorial triple search over the top-K candidates,
+    //       choosing the triple with the fewest false positives against
+    //       OTHER digits' instance pixels.  This is the bug the
+    //       single-offset score misses: D's fingerprint can avoid
+    //       matching any other digit's MEAN yet still match a real
+    //       INSTANCE of another digit (e.g. dark central offsets in '0'
+    //       also reading dark in '1' cells).  Ties broken by the sum of
+    //       per-offset scores so a clean triple still favours strong
+    //       single-pixel discrimination.
+    const int SELF_TOL = 15;
+    const int CANDIDATE_K = 20;
     auto pickOffsets = [&](int d) -> std::vector<int> {
         const std::vector<unsigned>& mine = avgColor[d];
         const std::vector<int>& dev = maxDev[d];
@@ -1034,15 +1045,92 @@ static int runOcrBuildMode(const std::wstring& filePath, const std::string& spec
                       if (a.first != b.first) return a.first > b.first;
                       return a.second < b.second;
                   });
-        std::vector<int> picked(3);
-        for (int j = 0; j < 3 && j < (int)scored.size(); ++j) picked[j] = scored[j].second;
-        printf("    '%d': top scores %d, %d, %d  (%d stable / %d rejected)\n",
-               d,
-               (int)scored.size() > 0 ? scored[0].first : -1,
-               (int)scored.size() > 1 ? scored[1].first : -1,
-               (int)scored.size() > 2 ? scored[2].first : -1,
-               (int)scored.size(), rejectedByVariance);
-        return picked;
+
+        // No combinatorial search if we have fewer than 3 candidates.
+        if ((int)scored.size() < 3) {
+            std::vector<int> picked(3, 0);
+            for (int j = 0; j < (int)scored.size(); ++j) picked[j] = scored[j].second;
+            return picked;
+        }
+
+        // Per-offset score lookup for the chosen-triple aggregate.
+        std::vector<int> offsetScore(N, 0);
+        for (size_t s = 0; s < scored.size(); ++s) offsetScore[scored[s].second] = scored[s].first;
+
+        // Top-K candidate offsets, then evaluate all C(K,3) triples.
+        const int K = (std::min)((int)scored.size(), CANDIDATE_K);
+        // Mirror the runtime walker's ±1 jitter retry — without this,
+        // an offset triple can read "clean" at bx but collide at bx-1
+        // and the runtime would still false-positive (see (1557,190)
+        // case where '0' picks match at jitter x=-1).
+        static const int kJitter[3] = { 0, -1, +1 };
+        auto countFP = [&](int o0, int o1, int o2) -> int {
+            int off[3] = { o0, o1, o2 };
+            int fp = 0;
+            for (auto jt = positions.begin(); jt != positions.end(); ++jt) {
+                if (jt->first == d) continue;
+                for (size_t p = 0; p < jt->second.size(); ++p) {
+                    int bx = jt->second[p].first;
+                    int by = jt->second[p].second;
+                    bool anyJitterMatched = false;
+                    for (int j = 0; j < 3 && !anyJitterMatched; ++j) {
+                        int xj = bx + kJitter[j];
+                        bool allMatch = true;
+                        for (int k = 0; k < 3; ++k) {
+                            int dx = off[k] % CW, dy = off[k] / CW;
+                            COLORREF got = inspReadPixel(xj + dx, by + dy);
+                            unsigned want = mine[off[k]];
+                            int wR = (want >> 16) & 0xFF;
+                            int wG = (want >> 8) & 0xFF;
+                            int wB = want & 0xFF;
+                            int gR = (int)(got & 0xFF);
+                            int gG = (int)((got >> 8) & 0xFF);
+                            int gB = (int)((got >> 16) & 0xFF);
+                            if (abs(gR - wR) > SELF_TOL ||
+                                abs(gG - wG) > SELF_TOL ||
+                                abs(gB - wB) > SELF_TOL) {
+                                allMatch = false;
+                                break;
+                            }
+                        }
+                        if (allMatch) anyJitterMatched = true;
+                    }
+                    if (anyJitterMatched) fp++;
+                }
+            }
+            return fp;
+        };
+
+        int bestFP = 1 << 30;   // "infinity" — definitely worse than any real FP count
+        long long bestAgg = -1;
+        int best[3] = { scored[0].second, scored[1].second, scored[2].second };
+        for (int a = 0; a < K; ++a) {
+            for (int b = a + 1; b < K; ++b) {
+                for (int c = b + 1; c < K; ++c) {
+                    int o0 = scored[a].second;
+                    int o1 = scored[b].second;
+                    int o2 = scored[c].second;
+                    int fp = countFP(o0, o1, o2);
+                    if (fp > bestFP) continue;
+                    long long agg = (long long)offsetScore[o0] +
+                                    offsetScore[o1] +
+                                    offsetScore[o2];
+                    if (fp < bestFP || agg > bestAgg) {
+                        bestFP = fp;
+                        bestAgg = agg;
+                        best[0] = o0; best[1] = o1; best[2] = o2;
+                    }
+                }
+            }
+        }
+        printf("    '%d': fp=%d  agg=%lld  picks=(%d,%d) (%d,%d) (%d,%d)  "
+               "(K=%d / %d stable / %d rejected)\n",
+               d, bestFP, bestAgg,
+               best[0] % CW, best[0] / CW,
+               best[1] % CW, best[1] / CW,
+               best[2] % CW, best[2] / CW,
+               K, (int)scored.size(), rejectedByVariance);
+        return { best[0], best[1], best[2] };
     };
 
     std::map<int, std::vector<int>> picks;
@@ -1077,40 +1165,53 @@ static int runOcrBuildMode(const std::wstring& filePath, const std::string& spec
                d);
     }
 
-    // In-memory self-test: walk each label and verify the freshly-built
-    // fingerprint identifies it (using the same algorithm shape as
-    // ocrDigitAt — just check the matching digit's 3 picked offsets
-    // with tol=15 and accept on success).  Reports which labels would
-    // not have round-tripped through the built table.
-    const int SELF_TOL = 15;
-    printf("\n[OCR_BUILD] self-test (tol=%d):\n", SELF_TOL);
+    // In-memory self-test using walker logic (mirrors ocrDigitAt):
+    // walk the freshly-built picks in table-emission order (digit 0..9),
+    // first matching digit wins.  Catches cross-fingerprint collisions
+    // (digit X's fingerprint matching a cell of digit Y) that the
+    // earlier per-digit round-trip test couldn't see.
+    printf("\n[OCR_BUILD] self-test (walker, tol=%d):\n", SELF_TOL);
     int rows = 0, passes = 0;
-    for (auto it = positions.begin(); it != positions.end(); ++it) {
-        int d = it->first;
-        const std::vector<int>& p = picks[d];
-        const std::vector<unsigned>& c = avgColor[d];
-        for (size_t pi = 0; pi < it->second.size(); ++pi) {
-            int bx = it->second[pi].first;
-            int by = it->second[pi].second;
-            bool ok = true;
-            for (int k = 0; k < 3; ++k) {
-                int dx = p[k] % CW;
-                int dy = p[k] / CW;
-                COLORREF got = inspReadPixel(bx + dx, by + dy);
-                int got_r = got & 0xFF;
-                int got_g = (got >> 8) & 0xFF;
-                int got_b = (got >> 16) & 0xFF;
-                int want_b = c[p[k]] & 0xFF;
-                int want_g = (c[p[k]] >> 8) & 0xFF;
-                int want_r = (c[p[k]] >> 16) & 0xFF;
-                if (abs(got_r - want_r) > SELF_TOL ||
-                    abs(got_g - want_g) > SELF_TOL ||
-                    abs(got_b - want_b) > SELF_TOL) {
-                    ok = false;
-                    break;
+    for (auto lit = positions.begin(); lit != positions.end(); ++lit) {
+        int expected = lit->first;
+        for (size_t pi = 0; pi < lit->second.size(); ++pi) {
+            int bx = lit->second[pi].first;
+            int by = lit->second[pi].second;
+            int got = -1;
+            // Iterate picks in std::map order (sorted by digit) — same
+            // order the emitted C++ entries appear in g_tables.  Mirror
+            // the runtime walker's ±1 jitter retry.
+            static const int kJitter[3] = { 0, -1, +1 };
+            for (auto pit = picks.begin(); pit != picks.end() && got < 0; ++pit) {
+                int d = pit->first;
+                const std::vector<int>& p = pit->second;
+                const std::vector<unsigned>& c = avgColor[d];
+                for (int j = 0; j < 3 && got < 0; ++j) {
+                    int xj = bx + kJitter[j];
+                    bool allMatch = true;
+                    for (int k = 0; k < 3; ++k) {
+                        int dx = p[k] % CW;
+                        int dy = p[k] / CW;
+                        COLORREF gotc = inspReadPixel(xj + dx, by + dy);
+                        int got_r = (int)(gotc & 0xFF);
+                        int got_g = (int)((gotc >> 8) & 0xFF);
+                        int got_b = (int)((gotc >> 16) & 0xFF);
+                        int want_r = (c[p[k]] >> 16) & 0xFF;
+                        int want_g = (c[p[k]] >> 8) & 0xFF;
+                        int want_b =  c[p[k]] & 0xFF;
+                        if (abs(got_r - want_r) > SELF_TOL ||
+                            abs(got_g - want_g) > SELF_TOL ||
+                            abs(got_b - want_b) > SELF_TOL) {
+                            allMatch = false;
+                            break;
+                        }
+                    }
+                    if (allMatch) got = d;
                 }
             }
-            printf("  (%d,%d)='%d' %s\n", bx, by, d, ok ? "PASS" : "FAIL");
+            bool ok = (got == expected);
+            printf("  (%d,%d)='%d' got=%d %s\n", bx, by, expected, got,
+                   ok ? "PASS" : "FAIL");
             rows++;
             if (ok) passes++;
         }
