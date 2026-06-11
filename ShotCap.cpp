@@ -930,6 +930,33 @@ static int runOcrTextMode(const std::wstring& filePath, const std::string& spec,
         X, Y, maxlen, maxMisses, tol, g_tables[g_active_table].count,
         g_active_table, g_tables[g_active_table].name);
 
+    // Cell-column brightness probe — used to skip the inter-digit gap
+    // after a hit so the walker re-tries at the LEFT EDGE of the next
+    // digit (not at the per-digit measured-width advance, which over-
+    // shoots into the previous digit's neighbour for narrow glyphs).
+    // Also bounds the sweep: if no bright column appears within
+    // MAX_GAP_SKIP after a hit, we've reached the end of the number.
+    // MIN_BRIGHT_RUN rejects isolated single-column brightness (e.g.
+    // the trailing anti-alias of the previous digit) — a real digit
+    // start has at least 2 consecutive bright columns.
+    const int CELL_H = 22;
+    const int COL_LUMA_THRESH = 180;
+    const int MAX_GAP_SKIP = 20;
+    const int MIN_BRIGHT_RUN = 2;
+    auto columnHasBright = [&](int cx) -> bool {
+        if (cx < 0 || cx >= g_insp.imgW) return false;
+        int y2 = Y + CELL_H;
+        if (y2 > g_insp.imgH) y2 = g_insp.imgH;
+        for (int yy = Y; yy < y2; ++yy) {
+            COLORREF c = inspReadPixel(cx, yy);
+            int luma = ((int)(c & 0xFF) * 299 +
+                        (int)((c >> 8) & 0xFF) * 587 +
+                        (int)((c >> 16) & 0xFF) * 114) / 1000;
+            if (luma >= COL_LUMA_THRESH) return true;
+        }
+        return false;
+    };
+
     std::string digits;
     int x = X;
     int misses = 0;
@@ -943,6 +970,34 @@ static int runOcrTextMode(const std::wstring& filePath, const std::string& spec,
             digits.push_back('0' + d);
             printf("  hit  x=%4d digit=%d  width=%d\n", x, d, width);
             x += width;
+            // Skip the inter-digit gap: advance to the start of the
+            // next bright RUN (≥ MIN_BRIGHT_RUN consecutive bright
+            // columns) — rejects the prev-digit anti-alias tail that
+            // bleeds 1 column past the digit body.  Terminates if no
+            // qualifying run appears within MAX_GAP_SKIP.
+            int skipped = 0;
+            int consecBright = 0;
+            int runStartX = -1;
+            while (skipped < MAX_GAP_SKIP && x < g_insp.imgW) {
+                if (columnHasBright(x)) {
+                    if (consecBright == 0) runStartX = x;
+                    consecBright++;
+                    if (consecBright >= MIN_BRIGHT_RUN) {
+                        x = runStartX;   // back to first bright col
+                        break;
+                    }
+                } else {
+                    consecBright = 0;
+                    runStartX = -1;
+                }
+                x++;
+                skipped++;
+            }
+            if (skipped >= MAX_GAP_SKIP || consecBright < MIN_BRIGHT_RUN) {
+                printf("  end  (no %d-bright run within %d cols after hit)\n",
+                       MIN_BRIGHT_RUN, MAX_GAP_SKIP);
+                break;
+            }
             misses = 0;
         } else {
             x += 1;
