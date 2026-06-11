@@ -281,6 +281,12 @@ void printUsage()
         << "                        Pair with -inspect <image>.\n"
         << "  -ocr_build_file <path>  Same as -ocr_build but reads spec from a text file\n"
         << "                        (avoids cmd/bash quoting issues for long specs).\n"
+        << "  -ocr_text \"X,Y[,maxlen[,max_misses]]\"  Read a multi-digit number starting at\n"
+        << "                        (X,Y).  After each hit, advance by the matched digit's\n"
+        << "                        width; after each miss, advance x by 1.  Stops at maxlen\n"
+        << "                        digits or max_misses consecutive misses (default 12/15 —\n"
+        << "                        the 15-miss budget tolerates one thousands-separator\n"
+        << "                        space).  Emits the digit string + composed integer.\n"
         << "  -ocr_scan \"X1,Y1,X2,Y2\" Auto-detect: walk every (x,y) in the rectangle,\n"
         << "                        run the OCR walker. On match, print \"(x,y) digit=N\"\n"
         << "                        and advance x by the matched entry's width to avoid\n"
@@ -717,13 +723,13 @@ static const OcrFP g_digit_table_modern[] = {
 // 38/38 PASS at tol=15 on the composite training set.
 static const OcrFP g_digit_table_pre[] = {
     { 0, {7,7,12},  {9,6,1},    {0x191C1C, 0x121413, 0xA5ABA2}, 13 },
-    { 1, {7,6,6},   {1,1,2},    {0x1E231C, 0x10150D, 0x0D110B}, 13 },
+    { 1, {7,6,6},   {1,1,2},    {0x1E231C, 0x10150D, 0x0D110B},  7 },
     { 2, {9,10,9},  {12,12,8},  {0x71736C, 0x565851, 0x4F514C}, 13 },
     { 3, {1,10,3},  {9,9,10},   {0x4A4F42, 0x9FA397, 0x2C2F24}, 13 },
     { 4, {2,3,1},   {15,15,15}, {0x030901, 0x050B03, 0x030801}, 13 },
     { 5, {9,12,10}, {16,3,5},   {0x0B0F0B, 0x3B4338, 0x0C0E0C}, 13 },
     { 6, {12,10,8}, {2,6,3},    {0x181D16, 0x454745, 0x5A5E5B}, 13 },
-    { 7, {9,8,10},  {13,13,13}, {0x0F170B, 0x091007, 0x11190A}, 13 },
+    { 7, {9,8,10},  {13,13,13}, {0x0F170B, 0x091007, 0x11190A}, 11 },
     { 8, {6,7,5},   {3,10,4},   {0x52544E, 0x8F918E, 0x3A3B37}, 13 },
     { 9, {5,6,12},  {5,10,13},  {0x343835, 0xB8BABA, 0x444E3F}, 13 },
 };
@@ -893,6 +899,69 @@ static int runOcrTestMode(const std::wstring& filePath, const std::string& spec,
     return (passes == rows) ? 0 : 1;
 }
 
+// -ocr_text "X,Y[,maxlen[,max_misses]]"
+// Sweep digits horizontally starting at (X,Y).  After each ocrDigitAtW
+// hit, advance x by the matched entry's width (currently 13 across the
+// table — narrow '1' may overshoot slightly but the ±1 jitter at the
+// next call usually re-finds the right column).  After each miss,
+// advance x by 1.  Stop when either maxlen digits collected or
+// max_misses consecutive misses (the latter handles trailing
+// background AND inter-group spaces between thousands separator).
+// Emits the digit sequence + composed integer + per-digit trace.
+static int runOcrTextMode(const std::wstring& filePath, const std::string& spec, int tol)
+{
+    g_insp.image = Gdiplus::Bitmap::FromFile(filePath.c_str());
+    if (!g_insp.image || g_insp.image->GetLastStatus() != Gdiplus::Ok) {
+        std::wcerr << L"[ERROR] Could not load image: " << filePath << std::endl;
+        return 1;
+    }
+    g_insp.imgW = g_insp.image->GetWidth();
+    g_insp.imgH = g_insp.image->GetHeight();
+
+    int X = 0, Y = 0, maxlen = 12, maxMisses = 15;
+    int n = sscanf_s(spec.c_str(), "%d,%d,%d,%d", &X, &Y, &maxlen, &maxMisses);
+    if (n < 2) {
+        std::cerr << "[ERROR] -ocr_text expects X,Y[,maxlen[,max_misses]] (e.g. 1538,34 or 1538,34,8,15)\n";
+        return 1;
+    }
+    if (maxlen <= 0 || maxlen > 32) maxlen = 12;
+    if (maxMisses <= 0 || maxMisses > 64) maxMisses = 15;
+    printf("[OCR_TEXT] start=(%d,%d) maxlen=%d maxMisses=%d tol=%d table=%d (id=%d \"%s\")\n",
+        X, Y, maxlen, maxMisses, tol, g_tables[g_active_table].count,
+        g_active_table, g_tables[g_active_table].name);
+
+    std::string digits;
+    int x = X;
+    int misses = 0;
+    int firstHitX = -1, lastHitX = -1;
+    while ((int)digits.size() < maxlen && misses < maxMisses && x < g_insp.imgW) {
+        int width = 1;
+        int d = ocrDigitAtW(x, Y, tol, &width);
+        if (d >= 0) {
+            if (firstHitX < 0) firstHitX = x;
+            lastHitX = x;
+            digits.push_back('0' + d);
+            printf("  hit  x=%4d digit=%d  width=%d\n", x, d, width);
+            x += width;
+            misses = 0;
+        } else {
+            x += 1;
+            misses += 1;
+        }
+    }
+    if (digits.empty()) {
+        printf("[OCR_TEXT] no digits found\n");
+        delete g_insp.image; g_insp.image = nullptr;
+        return 1;
+    }
+    long long value = 0;
+    for (size_t i = 0; i < digits.size(); ++i) value = value * 10 + (digits[i] - '0');
+    printf("[OCR_TEXT] -> \"%s\" (%d digits, value=%lld, span x=%d..%d)\n",
+        digits.c_str(), (int)digits.size(), value, firstHitX, lastHitX);
+    delete g_insp.image; g_insp.image = nullptr;
+    return 0;
+}
+
 // -ocr_build "x,y=d x,y=d ..."
 // Given labeled digit positions, picks 3 best discriminating fingerprint
 // offsets per digit and emits ready-to-paste table entries in both C++
@@ -965,6 +1034,59 @@ static int runOcrBuildMode(const std::wstring& filePath, const std::string& spec
         labelCount += (int)it->second.size();
     printf("[OCR_BUILD] %d labels covering %d distinct digit(s), cell=%dx%d\n",
            labelCount, (int)positions.size(), CW, CH);
+
+    // Per-digit measured width — scan columns left-to-right and look
+    // for the FIRST contiguous bright run followed by a dark gap of at
+    // least DARK_GAP_RUN columns.  Width = position of last bright
+    // column + 1 + the inter-digit-gap budget.  Picks the digit body
+    // out of the cell without bleeding into the next character (cell
+    // box CW=14 is sized for fingerprints, not advance — narrow digits
+    // like '1' would otherwise inherit neighbour brightness).  Average
+    // across all instances.
+    const int LUMA_EDGE_THRESH = 180;
+    const int DARK_GAP_RUN = 2;
+    const int INTER_DIGIT_GAP = 2;   // approx px between adjacent digits
+    std::map<int, int> digitWidth;
+    for (auto it = positions.begin(); it != positions.end(); ++it) {
+        int d = it->first;
+        const std::vector<std::pair<int,int>>& posns = it->second;
+        long long sumW = 0;
+        for (size_t p = 0; p < posns.size(); ++p) {
+            int lastBright = -1;
+            int darkRun = 0;
+            int measured = -1;
+            for (int dx = 0; dx < CW; ++dx) {
+                bool anyBright = false;
+                for (int dy = 0; dy < CH; ++dy) {
+                    COLORREF c = inspReadPixel(posns[p].first + dx, posns[p].second + dy);
+                    int luma = ((int)(c & 0xFF) * 299 +
+                                (int)((c >> 8) & 0xFF) * 587 +
+                                (int)((c >> 16) & 0xFF) * 114) / 1000;
+                    if (luma >= LUMA_EDGE_THRESH) { anyBright = true; break; }
+                }
+                if (anyBright) {
+                    lastBright = dx;
+                    darkRun = 0;
+                } else if (lastBright >= 0) {
+                    darkRun++;
+                    if (darkRun >= DARK_GAP_RUN) {
+                        measured = lastBright + 1;
+                        break;
+                    }
+                }
+            }
+            if (measured < 0) measured = (lastBright >= 0 ? lastBright + 1 : CW);
+            sumW += (measured + INTER_DIGIT_GAP);
+        }
+        int avgW = (int)(sumW / (long long)posns.size());
+        if (avgW < 3) avgW = 3;
+        if (avgW > CW - 1) avgW = CW - 1;
+        digitWidth[d] = avgW;
+    }
+    printf("[OCR_BUILD] measured widths (px):");
+    for (auto it = digitWidth.begin(); it != digitWidth.end(); ++it)
+        printf(" %d=%d", it->first, it->second);
+    printf("\n");
 
     // Per-(digit, offset) max-channel deviation across instances.  An
     // offset where one instance reads dramatically off-average can't
@@ -1141,17 +1263,19 @@ static int runOcrBuildMode(const std::wstring& filePath, const std::string& spec
     for (auto it = avgColor.begin(); it != avgColor.end(); ++it)
         picks[it->first] = pickOffsets(it->first);
 
-    // Emit C++ entries.
+    // Emit C++ entries (width = per-digit measured, drives -ocr_text
+    // advance).
     printf("\n// === C++ entries (paste into a new OcrFP[] in g_tables) ===\n");
     for (auto it = picks.begin(); it != picks.end(); ++it) {
         int d = it->first;
         const std::vector<int>& p = it->second;
         const std::vector<unsigned>& c = avgColor[d];
-        printf("    { %d, {%d,%d,%d}, {%d,%d,%d}, {0x%06X, 0x%06X, 0x%06X}, 13 },\n",
+        printf("    { %d, {%d,%d,%d}, {%d,%d,%d}, {0x%06X, 0x%06X, 0x%06X}, %d },\n",
                d,
                p[0] % CW, p[1] % CW, p[2] % CW,
                p[0] / CW, p[1] / CW, p[2] / CW,
-               c[p[0]], c[p[1]], c[p[2]]);
+               c[p[0]], c[p[1]], c[p[2]],
+               digitWidth[d]);
     }
 
     // Emit asm entries (cf22 layout: digit, 3x(dx,dy,color), width).
@@ -1160,11 +1284,12 @@ static int runOcrBuildMode(const std::wstring& filePath, const std::string& spec
         int d = it->first;
         const std::vector<int>& p = it->second;
         const std::vector<unsigned>& c = avgColor[d];
-        printf("    dd %d, %d, %d, 0%06Xh, %d, %d, 0%06Xh, %d, %d, 0%06Xh, 13   ; '%d'\n",
+        printf("    dd %d, %d, %d, 0%06Xh, %d, %d, 0%06Xh, %d, %d, 0%06Xh, %d   ; '%d'\n",
                d,
                p[0] % CW, p[0] / CW, c[p[0]],
                p[1] % CW, p[1] / CW, c[p[1]],
                p[2] % CW, p[2] / CW, c[p[2]],
+               digitWidth[d],
                d);
     }
 
@@ -1497,6 +1622,7 @@ int main(int argc, char* argv[])
     std::string  ocrTestSpec;            // -ocr_test "<assertions>"
     std::string  ocrScanSpec;            // -ocr_scan "X1,Y1,X2,Y2"
     std::string  ocrBuildSpec;           // -ocr_build "x,y=d x,y=d ..."
+    std::string  ocrTextSpec;            // -ocr_text "X,Y[,maxlen[,max_misses]]"
 
     // Parse command-line arguments.
     for (int i = 1; i < argc; i++)
@@ -1661,6 +1787,11 @@ int main(int argc, char* argv[])
         else if (arg == "-ocr_scan" && i + 1 < argc)
         {
             ocrScanSpec = argv[i + 1];
+            i++;
+        }
+        else if (arg == "-ocr_text" && i + 1 < argc)
+        {
+            ocrTextSpec = argv[i + 1];
             i++;
         }
         else if (arg == "-ocr_build" && i + 1 < argc)
@@ -1920,6 +2051,17 @@ int main(int argc, char* argv[])
             return 1;
         }
         int rc = runOcrBuildMode(inspectFile, ocrBuildSpec);
+        GdiplusShutdown(gdiplusToken);
+        return rc;
+    }
+    if (!ocrTextSpec.empty())
+    {
+        if (inspectFile.empty()) {
+            std::cerr << "[ERROR] -ocr_text requires -inspect <file> to know which image to read.\n";
+            GdiplusShutdown(gdiplusToken);
+            return 1;
+        }
+        int rc = runOcrTextMode(inspectFile, ocrTextSpec, checkTol);
         GdiplusShutdown(gdiplusToken);
         return rc;
     }
