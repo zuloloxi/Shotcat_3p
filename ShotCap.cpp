@@ -723,13 +723,13 @@ static const OcrFP g_digit_table_modern[] = {
 // 38/38 PASS at tol=15 on the composite training set.
 static const OcrFP g_digit_table_pre[] = {
     { 0, {7,7,12},  {9,6,1},    {0x191C1C, 0x121413, 0xA5ABA2}, 13 },
-    { 1, {7,6,6},   {1,1,2},    {0x1E231C, 0x10150D, 0x0D110B},  7 },
+    { 1, {7,6,13},  {1,1,14},   {0x1E231C, 0x10150D, 0xEFF1EE},  7 },
     { 2, {9,10,9},  {12,12,8},  {0x71736C, 0x565851, 0x4F514C}, 13 },
     { 3, {1,10,3},  {9,9,10},   {0x4A4F42, 0x9FA397, 0x2C2F24}, 13 },
-    { 4, {2,3,1},   {15,15,15}, {0x030901, 0x050B03, 0x030801}, 13 },
-    { 5, {9,12,10}, {16,3,5},   {0x0B0F0B, 0x3B4338, 0x0C0E0C}, 13 },
+    { 4, {2,3,4},   {15,15,10}, {0x030901, 0x050B03, 0xF2F5F0}, 13 },
+    { 5, {9,7,10},  {16,11,5},  {0x0B0F0B, 0xFAFBF9, 0x0C0E0C}, 13 },
     { 6, {12,10,8}, {2,6,3},    {0x181D16, 0x454745, 0x5A5E5B}, 13 },
-    { 7, {9,8,10},  {13,13,13}, {0x0F170B, 0x091007, 0x11190A}, 11 },
+    { 7, {9,8,3},   {13,13,4},  {0x0F170B, 0x091007, 0x7E8580}, 11 },
     { 8, {6,7,5},   {3,10,4},   {0x52544E, 0x8F918E, 0x3A3B37}, 13 },
     { 9, {5,6,12},  {5,10,13},  {0x343835, 0xB8BABA, 0x444E3F}, 13 },
 };
@@ -1226,21 +1226,57 @@ static int runOcrBuildMode(const std::wstring& filePath, const std::string& spec
             return fp;
         };
 
+        // Require at least one of the 3 offsets to have luma >=
+        // MIN_BRIGHT_LUMA.  Without this, all-dark fingerprints (e.g.
+        // '4' with picks at the bottom-left dark corner) match any
+        // dark background under jitter — silently producing
+        // false-positives outside the labeled cells.  Falls back to
+        // ignoring the constraint if NO triple has a bright offset
+        // (would only happen for genuinely all-dark digits).
+        const int MIN_BRIGHT_LUMA = 80;
+        auto lumaOf = [&](int off) -> int {
+            unsigned c = mine[off];
+            int r = (c >> 16) & 0xFF;
+            int g = (c >> 8)  & 0xFF;
+            int b =  c        & 0xFF;
+            return (r * 299 + g * 587 + b * 114) / 1000;
+        };
+        auto tripleHasBright = [&](int o0, int o1, int o2) -> bool {
+            return lumaOf(o0) >= MIN_BRIGHT_LUMA ||
+                   lumaOf(o1) >= MIN_BRIGHT_LUMA ||
+                   lumaOf(o2) >= MIN_BRIGHT_LUMA;
+        };
+
         int bestFP = 1 << 30;   // "infinity" — definitely worse than any real FP count
         long long bestAgg = -1;
         int best[3] = { scored[0].second, scored[1].second, scored[2].second };
+        bool foundBright = false;
         for (int a = 0; a < K; ++a) {
             for (int b = a + 1; b < K; ++b) {
                 for (int c = b + 1; c < K; ++c) {
                     int o0 = scored[a].second;
                     int o1 = scored[b].second;
                     int o2 = scored[c].second;
+                    bool brightOK = tripleHasBright(o0, o1, o2);
+                    // Strict mode: prefer triples with a bright sample.
+                    // Once any bright triple seen, ignore dark-only ones.
+                    if (foundBright && !brightOK) continue;
                     int fp = countFP(o0, o1, o2);
                     if (fp > bestFP) continue;
                     long long agg = (long long)offsetScore[o0] +
                                     offsetScore[o1] +
                                     offsetScore[o2];
-                    if (fp < bestFP || agg > bestAgg) {
+                    bool better = false;
+                    if (brightOK && !foundBright) {
+                        // First bright triple seen — reset; bright always wins over dark.
+                        better = true;
+                        foundBright = true;
+                    } else if (fp < bestFP) {
+                        better = true;
+                    } else if (fp == bestFP && agg > bestAgg) {
+                        better = true;
+                    }
+                    if (better) {
                         bestFP = fp;
                         bestAgg = agg;
                         best[0] = o0; best[1] = o1; best[2] = o2;
@@ -1249,11 +1285,12 @@ static int runOcrBuildMode(const std::wstring& filePath, const std::string& spec
             }
         }
         printf("    '%d': fp=%d  agg=%lld  picks=(%d,%d) (%d,%d) (%d,%d)  "
-               "(K=%d / %d stable / %d rejected)\n",
+               "bright=%s (K=%d / %d stable / %d rejected)\n",
                d, bestFP, bestAgg,
                best[0] % CW, best[0] / CW,
                best[1] % CW, best[1] / CW,
                best[2] % CW, best[2] / CW,
+               foundBright ? "yes" : "NO-fallback",
                K, (int)scored.size(), rejectedByVariance);
         return { best[0], best[1], best[2] };
     };
