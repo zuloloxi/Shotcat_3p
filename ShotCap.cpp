@@ -258,9 +258,9 @@ void printUsage()
         << "                        Logs got/want/diff/MATCH-MISS per row, exit 0 if all\n"
         << "                        within -tol (default 20 per channel). No window opens.\n"
         << "  -tol N                Per-channel tolerance for -check (default 20).\n"
-        << "  -table N              Select fingerprint table for -ocr_test / -ocr_scan\n"
-        << "                        (default 0 = modern CoC font, 1 = pre-change font).\n"
-        << "                        Lets one binary serve both font eras without rebuild.\n"
+        << "  -table N              Select fingerprint table for -ocr_test / -ocr_scan /\n"
+        << "                        -ocr_text (default 0=modern coc1.png era, 1=pre-change\n"
+        << "                        BlueStacks-era, 2=modern-ldplayer Android emulator).\n"
         << "  -grid WxH             Dump a WxH ASCII shape map (. dark / o mid / W light)\n"
         << "                        starting at -base. Lets you see digit shape at a glance.\n"
         << "                        Pair with -inspect <file> and -base X,Y.\n"
@@ -734,6 +734,35 @@ static const OcrFP g_digit_table_pre[] = {
     { 9, {5,6,12},  {5,10,13},  {0x343835, 0xB8BABA, 0x444E3F}, 13 },
 };
 
+// Table id 2 — "modern-ldplayer" (LDPlayer Android emulator, 2026 era
+// modern CoC font).  Trained on GOLD COUNTERS ONLY from 2 frames
+// (ld1_f01 "11 988 654" + ld2_f02 "12 326 504") — 16 labels covering
+// digits 0,1,2,3,4,5,6,8,9.  Self-test 16/16 PASS at tol=15.  Cell
+// base y = digit top - 14 to align with coc1-style cell convention.
+//
+// '7' missing — no LD gold counter sampled contained a '7'.  Add a
+// frame with '7' in the gold row when needed.  Other-color elixir
+// counter (pink) was deliberately excluded — mixing yellow gold and
+// pink elixir digit colors for the same digit class degenerates the
+// variance filter and gives "bright=NO-fallback" picks that match
+// background instead of digit body.
+//
+// Distinct from g_digit_table_modern (id 0) because LDPlayer's render
+// pipeline produces fundamentally different anti-aliased pixel values
+// from the coc1.png source (cross-render composite training was tried
+// and degenerated — see #47).
+static const OcrFP g_digit_table_ld[] = {
+    { 0, {1,1,2},   {16,17,16}, {0x6E5F35, 0x6D644B, 0x928159}, 13 },
+    { 1, {6,6,6},   {17,13,14}, {0x535856, 0x363C3B, 0x3E4543},  7 },
+    { 2, {12,6,0},  {20,16,17}, {0x5D5852, 0xF3F1E6, 0x9B9790}, 13 },
+    { 3, {11,11,10},{15,21,15}, {0x32272D, 0x17120B, 0x73686E}, 12 },
+    { 4, {11,13,10},{19,13,19}, {0xEDD75B, 0xEFDD52, 0xF5E16C},  8 },
+    { 5, {5,5,4},   {11,14,15}, {0xD5BF67, 0xC4B47F, 0xE2D9C1}, 13 },
+    { 6, {9,7,13},  {19,18,16}, {0x352D26, 0x6D6557, 0x4F452C}, 13 },
+    { 8, {13,6,13}, {21,17,19}, {0x373328, 0xA39B93, 0x706A5C}, 13 },
+    { 9, {12,0,1},  {14,14,14}, {0x545656, 0x5D5F5F, 0x7F8181}, 13 },
+};
+
 // Registry of available fingerprint tables.  Selectable at runtime via
 // -table <id> (default 0 = modern).  Extend by adding a new const
 // OcrFP[] above and a row here.
@@ -745,6 +774,7 @@ struct OcrTable {
 static const OcrTable g_tables[] = {
     { g_digit_table_modern, sizeof(g_digit_table_modern) / sizeof(OcrFP), "modern" },
     { g_digit_table_pre,    sizeof(g_digit_table_pre)    / sizeof(OcrFP), "pre-change" },
+    { g_digit_table_ld,     sizeof(g_digit_table_ld)     / sizeof(OcrFP), "modern-ldplayer" },
 };
 static const int g_table_count = sizeof(g_tables) / sizeof(g_tables[0]);
 static int g_active_table = 0;   // updated by -table CLI parser
@@ -941,7 +971,7 @@ static int runOcrTextMode(const std::wstring& filePath, const std::string& spec,
     // start has at least 2 consecutive bright columns.
     const int CELL_H = 22;
     const int COL_LUMA_THRESH = 180;
-    const int MAX_GAP_SKIP = 20;
+    const int MAX_GAP_SKIP = 30;   // was 20 — LDPlayer's wider inter-digit spacing
     const int MIN_BRIGHT_RUN = 2;
     auto columnHasBright = [&](int cx) -> bool {
         if (cx < 0 || cx >= g_insp.imgW) return false;
