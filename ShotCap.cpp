@@ -752,15 +752,15 @@ static const OcrFP g_digit_table_pre[] = {
 // from the coc1.png source (cross-render composite training was tried
 // and degenerated — see #47).
 static const OcrFP g_digit_table_ld[] = {
-    { 0, {1,1,2},   {16,17,16}, {0x6E5F35, 0x6D644B, 0x928159}, 13 },
+    { 0, {1,1,0},   {16,17,14}, {0x6E5F35, 0x6D644B, 0xD5C375}, 13 },
     { 1, {6,6,6},   {17,13,14}, {0x535856, 0x363C3B, 0x3E4543},  7 },
     { 2, {12,6,0},  {20,16,17}, {0x5D5852, 0xF3F1E6, 0x9B9790}, 13 },
     { 3, {11,11,10},{15,21,15}, {0x32272D, 0x17120B, 0x73686E}, 12 },
     { 4, {11,13,10},{19,13,19}, {0xEDD75B, 0xEFDD52, 0xF5E16C},  8 },
-    { 5, {5,5,4},   {11,14,15}, {0xD5BF67, 0xC4B47F, 0xE2D9C1}, 13 },
+    { 5, {5,5,6},   {11,14,19}, {0xD5BF67, 0xC4B47F, 0xB4B1A6}, 13 },
     { 6, {9,7,13},  {19,18,16}, {0x352D26, 0x6D6557, 0x4F452C}, 13 },
     { 8, {13,6,13}, {21,17,19}, {0x373328, 0xA39B93, 0x706A5C}, 13 },
-    { 9, {12,0,1},  {14,14,14}, {0x545656, 0x5D5F5F, 0x7F8181}, 13 },
+    { 9, {12,1,0},  {14,14,16}, {0x545656, 0x7F8181, 0x898B8B}, 13 },
 };
 
 // Registry of available fingerprint tables.  Selectable at runtime via
@@ -1269,11 +1269,18 @@ static int runOcrBuildMode(const std::wstring& filePath, const std::string& spec
 
         // Top-K candidate offsets, then evaluate all C(K,3) triples.
         const int K = (std::min)((int)scored.size(), CANDIDATE_K);
-        // Mirror the runtime walker's ±1 jitter retry — without this,
-        // an offset triple can read "clean" at bx but collide at bx-1
-        // and the runtime would still false-positive (see (1557,190)
-        // case where '0' picks match at jitter x=-1).
-        static const int kJitter[3] = { 0, -1, +1 };
+        // Mirror the runtime walker's probing pattern more aggressively.
+        // The walker doesn't only test at labeled-base positions; after
+        // a hit it advances by digit width + does a gap-skip, landing at
+        // ANY x between the labels.  Testing ±1 jitter around the
+        // labeled-base of an other-digit instance only catches an FP
+        // when the candidate offsets collide AT that exact label.  But
+        // the walker also probes the trailing anti-alias of one digit
+        // and the leading anti-alias of the next (the gap between
+        // labels).  Sweep over a wider range (JITTER_SWEEP cols each
+        // side of each other-digit labeled base) to catch FPs that the
+        // walker would actually hit in practice.
+        const int JITTER_SWEEP = 7;  // covers half-width of an avg digit
         auto countFP = [&](int o0, int o1, int o2) -> int {
             int off[3] = { o0, o1, o2 };
             int fp = 0;
@@ -1283,8 +1290,8 @@ static int runOcrBuildMode(const std::wstring& filePath, const std::string& spec
                     int bx = jt->second[p].first;
                     int by = jt->second[p].second;
                     bool anyJitterMatched = false;
-                    for (int j = 0; j < 3 && !anyJitterMatched; ++j) {
-                        int xj = bx + kJitter[j];
+                    for (int j = -JITTER_SWEEP; j <= JITTER_SWEEP && !anyJitterMatched; ++j) {
+                        int xj = bx + j;
                         bool allMatch = true;
                         for (int k = 0; k < 3; ++k) {
                             int dx = off[k] % CW, dy = off[k] / CW;
